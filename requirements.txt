@@ -1,0 +1,32 @@
+# bellhop – Python dependencies
+# Install inside Docker:  pip install -r requirements.txt
+# Install locally:        pip install -r requirements.txt  (inside a venv)
+
+# ── ROS 2 bag reading ─────────────────────────────────────────────────────
+rosbags>=0.10.0
+
+# ── 3D processing ─────────────────────────────────────────────────────────
+open3d>=0.18.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# ── Occupancy grid (og_map pipeline only) ─────────────────────────────────
+# pyoctomap must be built against the system liboctomap-dev.
+# Inside the Docker image this resolves correctly.
+pyoctomap>=1.2.0
+PyYAML>=6.0
+
+# ── Image processing (color_mesh + color_tiles_3d pipelines) ──────────────
+Pillow>=10.0.0
+
+# ── Georeferencing (tiles_3d + color_tiles_3d pipelines) ──────────────────
+pyproj>=3.5.0
+py3dtiles>=4.0.0
+
+# ── Progress bars ─────────────────────────────────────────────────────────
+tqdm>=4.65.0
+
+# ── Optional fast PointCloud2 parser (og_map pipeline) ────────────────────
+# If installed, pointcloud2_to_numpy() uses the robotdatapy fast path;
+# otherwise it falls back to a pure-numpy implementation automatically.
+# robotdatapy @ git+https://github.com/mbpeterson70/robotdatapy.git
