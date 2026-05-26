@@ -1,6 +1,6 @@
 # bellhop
 
-**bellhop** converts ROS 2 bag files into spatial outputs — occupancy grids, surface meshes, Gazebo worlds, and Cesium 3D Tiles — through a unified CLI and graphical launcher.
+**bellhop** converts ROS 2 bag files into spatial outputs (occupancy grids, surface meshes, Gazebo worlds, and Cesium 3D Tiles) through a unified CLI and graphical launcher.
 
 ---
 
