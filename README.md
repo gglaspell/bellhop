@@ -1,10 +1,10 @@
-# bellhop
+# 🛎️ bellhop
 
 **bellhop** converts ROS 2 bag files into spatial outputs (occupancy grids, surface meshes, Gazebo worlds, and Cesium 3D Tiles) through a unified CLI and graphical launcher.
 
 ---
 
-## Table of Contents
+## 📋 Table of Contents
 
 - [What it does](#what-it-does)
 - [Requirements](#requirements)
@@ -25,7 +25,7 @@
 
 ---
 
-## What it does
+## 🦾 What it does
 
 Each pipeline reads one or more topics from a ROS 2 bag, registers the point-cloud frames with ICP, and writes a ready-to-use spatial artifact:
 
@@ -40,7 +40,7 @@ Each pipeline reads one or more topics from a ROS 2 bag, registers the point-clo
 
 ---
 
-## Requirements
+## ⚙️ Requirements
 
 ### To use the CLI or run pipelines via Docker
 
@@ -71,7 +71,7 @@ ros2 bag info /path/to/bag
 
 ---
 
-## Quick start with Docker (CLI)
+## 💨 Quick start with Docker (CLI)
 
 ### 1. Clone and build
 
@@ -132,7 +132,7 @@ docker run --rm \
 
 ---
 
-## Graphical launcher (GUI)
+## 🖥️ Graphical launcher (GUI)
 
 The GUI runs **on your host machine** — not inside Docker. It requires only Python's built-in `tkinter` and a working `docker` installation. No ROS, no Open3D, no heavy dependencies on the host.
 
@@ -189,7 +189,7 @@ Enter **host-side absolute paths** in the Bag and Output fields (e.g. `/home/use
 
 ---
 
-## Project layout
+## 📊 Project layout
 
 ```
 bellhop/
@@ -214,7 +214,7 @@ bellhop/
 
 ---
 
-## Pipelines
+## 🧠 Pipelines
 
 All pipelines follow the same calling convention inside the container:
 
@@ -343,7 +343,7 @@ All `tiles_3d` and `color_mesh` options apply.
 
 ---
 
-## Shared parameters
+## 🗘 Shared parameters
 
 These options are accepted by all pipelines that run ICP registration (`mesh`, `color_mesh`, `gazebo_world`, `tiles_3d`, `color_tiles_3d`):
 
@@ -361,7 +361,7 @@ These options are accepted by all pipelines that run ICP registration (`mesh`, `
 
 ---
 
-## Pre-flight topic check
+## ✈️ Pre-flight topic check
 
 Before running any computationally heavy pipeline, bellhop verifies that all required topics are present in the bag. If a topic is missing, the run stops immediately with a clear error rather than failing partway through.
 
@@ -387,7 +387,7 @@ ros2 bag info /path/to/bag
 
 ---
 
-## Running without Docker
+## 🦿 Running without Docker
 
 If you want to run pipelines directly on the host (e.g. for development):
 
@@ -411,7 +411,7 @@ The GUI can still be used on the host in this mode — it will call `docker run`
 
 ---
 
-## Per-pipeline documentation
+## 📝 Per-pipeline documentation
 
 Original per-pipeline README files from before the merge are preserved in `docs/`:
 
