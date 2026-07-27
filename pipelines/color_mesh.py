@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""
-color_mesh.py – ROS 2 bag -> registered colored point cloud -> Poisson mesh.
-"""
+"""ROS 2 bag -> memory-bounded camera-coloured Poisson mesh."""
 
+from __future__ import annotations
+
+import argparse
+import gc
 import sys
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -23,264 +26,623 @@ from .shared.registration import (
 )
 from .shared.ros_io import (
     TYPESTORE,
-    convert_ros_pc2_to_o3d,
     convert_ros_image,
-    get_odom_transform,
+    convert_ros_pc2_to_o3d,
     get_closest_timestamp,
+    get_odom_transform,
     intrinsics_from_camera_info,
 )
 
 
-# ---------------------------------------------------------------------------
-# Color projection helpers
-# ---------------------------------------------------------------------------
 def _color_pcd_from_image(
-    pcd, img: Image.Image, camera_pose: np.ndarray,
-    intrinsics: tuple, color_min_depth=0.1, color_max_depth=None,
+    pcd: o3d.geometry.PointCloud,
+    image: Image.Image,
+    camera_pose: np.ndarray,
+    intrinsics: tuple,
+    min_depth: float,
+    max_depth: float | None,
 ) -> o3d.geometry.PointCloud:
-    fx, fy, cx, cy, img_w, img_h = intrinsics
-    pts    = np.asarray(pcd.points)
-    img_arr = np.asarray(img)
-    cam_pos = camera_pose[:3, 3]
-    cam_rot = R.from_matrix(camera_pose[:3, :3])
+    fx, fy, cx, cy, width, height = intrinsics
+    points = np.asarray(pcd.points)
+    image_array = np.asarray(image)
 
-    body  = cam_rot.inv().apply(pts - cam_pos)
-    opt_x = -body[:, 1]
-    opt_y = -body[:, 2]
-    opt_z =  body[:, 0]
-    depth = np.linalg.norm(body, axis=1)
+    rotation = R.from_matrix(camera_pose[:3, :3])
+    body = rotation.inv().apply(points - camera_pose[:3, 3])
 
-    valid = (opt_z > 1e-6) & (depth >= color_min_depth)
-    if color_max_depth is not None:
-        valid &= (depth <= color_max_depth)
+    optical_x = -body[:, 1]
+    optical_y = -body[:, 2]
+    optical_z = body[:, 0]
+    distance = np.linalg.norm(body, axis=1)
 
-    z_safe = np.where(opt_z > 1e-6, opt_z, 1e-6)
-    u = fx * (opt_x / z_safe) + cx
-    v = fy * (opt_y / z_safe) + cy
-    valid &= (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+    valid = (optical_z > 1e-6) & (distance >= min_depth)
 
-    colors = np.full((len(pts), 3), 0.5, dtype=np.float64)
+    if max_depth is not None:
+        valid &= distance <= max_depth
+
+    safe_z = np.where(optical_z > 1e-6, optical_z, 1e-6)
+    u = fx * optical_x / safe_z + cx
+    v = fy * optical_y / safe_z + cy
+
+    valid &= (u >= 0) & (u < width) & (v >= 0) & (v < height)
+
+    colors = np.full((len(points), 3), 0.5, dtype=np.float64)
+
     if np.any(valid):
-        ui = np.clip(u[valid].astype(np.int32), 0, img_w - 1)
-        vi = np.clip(v[valid].astype(np.int32), 0, img_h - 1)
-        colors[valid] = img_arr[vi, ui] / 255.0
+        colors[valid] = (
+            image_array[
+                np.clip(v[valid].astype(np.int32), 0, height - 1),
+                np.clip(u[valid].astype(np.int32), 0, width - 1),
+                :3,
+            ]
+            / 255.0
+        )
 
     pcd.colors = o3d.utility.Vector3dVector(colors)
     return pcd
 
 
-def _merge_colored_pcds(
-    colored_pcds: list, voxel_size: float, gray_filter_radius: float, workers: int = 4
+def _remove_local_gray_fill(
+    pcd: o3d.geometry.PointCloud,
+    radius: float,
 ) -> o3d.geometry.PointCloud:
-    all_pts, all_cols, all_nors, all_gray = [], [], [], []
-    for pcd in colored_pcds:
-        if len(pcd.points) == 0 or not pcd.has_colors():
-            continue
-        pts  = np.asarray(pcd.points,  dtype=np.float64)
-        cols = np.asarray(pcd.colors,  dtype=np.float64)
-        nors = (np.asarray(pcd.normals, dtype=np.float64)
-                if pcd.has_normals() else np.zeros((len(pts), 3)))
-        std  = np.std(cols, axis=1)
-        mean = np.mean(cols, axis=1)
-        is_gray = (std < 0.08) & (np.abs(mean - 0.5) < 0.15)
-        all_pts.append(pts); all_cols.append(cols)
-        all_nors.append(nors); all_gray.append(is_gray)
+    """Remove neutral placeholder colour only near genuine coloured points."""
+    if radius <= 0 or not pcd.has_colors() or not len(pcd.points):
+        return pcd
 
-    if not all_pts:
-        raise ValueError("No valid colored point clouds to merge.")
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
 
-    pts   = np.vstack(all_pts)
-    cols  = np.vstack(all_cols)
-    nors  = np.vstack(all_nors)
-    is_gray = np.hstack(all_gray)
+    neutral = (
+        (np.std(colors, axis=1) < 0.08)
+        & (np.abs(np.mean(colors, axis=1) - 0.5) < 0.15)
+    )
 
-    colored_pts = pts[~is_gray]
-    if len(colored_pts) > 0 and gray_filter_radius > 0:
-        print(f"  Gray-fill filtering (radius={gray_filter_radius} m)...")
-        tree = cKDTree(colored_pts)
-        gray_idx = np.where(is_gray)[0]
-        nbrs = tree.query_ball_point(pts[gray_idx], r=gray_filter_radius)
-        has_col = np.array([len(n) > 0 for n in nbrs], dtype=bool)
-        keep = np.ones(len(pts), dtype=bool)
-        keep[gray_idx[has_col]] = False
-        pts = pts[keep]; cols = cols[keep]; nors = nors[keep]
+    colored_points = points[~neutral]
 
+    if not len(colored_points) or not neutral.any():
+        return pcd
+
+    neighbors = cKDTree(colored_points).query_ball_point(
+        points[neutral],
+        radius,
+    )
+
+    near_color = np.array(
+        [len(neighbors_for_point) > 0 for neighbors_for_point in neighbors],
+        dtype=bool,
+    )
+
+    keep = np.ones(len(points), dtype=bool)
+    keep[np.flatnonzero(neutral)[near_color]] = False
+
+    return pcd.select_by_index(np.flatnonzero(keep))
+
+
+def _merge_chunk(
+    target: o3d.geometry.PointCloud,
+    chunk: list[o3d.geometry.PointCloud],
+    voxel_size: float,
+    gray_filter_radius: float,
+) -> o3d.geometry.PointCloud:
+    """Merge a bounded chunk and voxelize immediately."""
+    if not chunk:
+        return target
+
+    local = o3d.geometry.PointCloud()
+
+    for cloud in chunk:
+        local += cloud
+
+    chunk.clear()
+
+    local = _remove_local_gray_fill(local, gray_filter_radius)
+
+    if len(target.points):
+        target += local
+    else:
+        target = local
+
+    return target.voxel_down_sample(voxel_size)
+
+
+def _read_registration_data(
+    bag_path: Path,
+    args,
+) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], dict[int, np.ndarray]]:
+    """First pass: retain only bounded, voxelized registration scans."""
+    topics = [args.pc_topic] + (
+        [args.odom_topic] if args.odom_topic else []
+    )
+
+    frames: list[tuple[int, o3d.geometry.PointCloud]] = []
+    odom_data: dict[int, np.ndarray] = {}
+
+    seen_clouds = 0
+    frame_stride = max(1, int(args.frame_stride))
+    frame_limit = int(args.max_registration_frames)
+
+    print(f"Reading registration frames: {bag_path}")
+
+    with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
+        connections = [
+            connection
+            for connection in reader.connections
+            if connection.topic in topics
+        ]
+
+        for connection, timestamp, raw in tqdm(
+            reader.messages(connections=connections),
+            desc="Reading",
+        ):
+            try:
+                message = reader.deserialize(raw, connection.msgtype)
+
+                if connection.topic == args.odom_topic:
+                    transform = get_odom_transform(message)
+
+                    if transform is not None:
+                        odom_data[timestamp] = transform
+
+                    continue
+
+                if connection.topic != args.pc_topic:
+                    continue
+
+                seen_clouds += 1
+
+                if (seen_clouds - 1) % frame_stride:
+                    continue
+
+                if frame_limit and len(frames) >= frame_limit:
+                    continue
+
+                cloud = convert_ros_pc2_to_o3d(message)
+
+                if cloud is None or len(cloud.points) < args.min_frame_points:
+                    continue
+
+                cloud = cloud.voxel_down_sample(args.voxel_size)
+
+                if len(cloud.points) >= args.min_frame_points:
+                    frames.append((timestamp, cloud))
+
+            except Exception:
+                continue
+
+    return frames, odom_data
+
+
+def _nearest_image(
+    timestamp: int,
+    images: deque[tuple[int, Image.Image]],
+) -> tuple[int, Image.Image] | None:
+    if not images:
+        return None
+
+    return min(images, key=lambda item: abs(item[0] - timestamp))
+
+
+def _stream_colored_merge(
+    bag_path: Path,
+    args,
+    poses: dict[int, np.ndarray],
+    odom_data: dict[int, np.ndarray],
+    initial_intrinsics: tuple | None,
+) -> o3d.geometry.PointCloud:
+    """
+    Second pass: stream images and selected clouds in time order.
+
+    Only a small rolling image buffer and one merge chunk are retained.
+    """
+    topics = [
+        args.pc_topic,
+        args.camera_topic,
+        args.camera_info_topic,
+    ]
+
+    max_time_delta_ns = int(args.max_time_diff * 1e9)
+    odom_timestamps = sorted(odom_data)
+    images: deque[tuple[int, Image.Image]] = deque()
+    pending_clouds: deque[tuple[int, o3d.geometry.PointCloud]] = deque()
+
+    intrinsics = initial_intrinsics
     merged = o3d.geometry.PointCloud()
-    merged.points = o3d.utility.Vector3dVector(pts)
-    merged.colors = o3d.utility.Vector3dVector(cols)
-    if np.any(np.linalg.norm(nors, axis=1) > 0):
-        from .shared.registration import _safe_normalize
-        merged.normals = o3d.utility.Vector3dVector(_safe_normalize(nors))
+    chunk: list[o3d.geometry.PointCloud] = []
+    chunk_size = max(1, int(args.merge_chunk_frames))
 
-    return merged.voxel_down_sample(voxel_size)
+    def flush(until_timestamp: int, final: bool = False) -> None:
+        nonlocal merged
+
+        while pending_clouds and (
+            final
+            or pending_clouds[0][0] + max_time_delta_ns <= until_timestamp
+        ):
+            cloud_timestamp, cloud = pending_clouds.popleft()
+            image_item = _nearest_image(cloud_timestamp, images)
+
+            if (
+                image_item is not None
+                and intrinsics is not None
+                and abs(image_item[0] - cloud_timestamp) <= max_time_delta_ns
+            ):
+                camera_pose = np.eye(4)
+
+                if odom_timestamps:
+                    closest_odom = get_closest_timestamp(
+                        cloud_timestamp,
+                        odom_timestamps,
+                    )
+
+                    if (
+                        closest_odom is not None
+                        and abs(closest_odom - cloud_timestamp)
+                        <= int(args.odom_max_latency * 1e9)
+                    ):
+                        camera_pose = odom_data[closest_odom]
+
+                cloud = _color_pcd_from_image(
+                    cloud,
+                    image_item[1],
+                    camera_pose,
+                    intrinsics,
+                    args.color_min_depth,
+                    args.color_max_depth,
+                )
+
+            chunk.append(cloud)
+
+            if len(chunk) >= chunk_size:
+                merged = _merge_chunk(
+                    merged,
+                    chunk,
+                    args.voxel_size,
+                    args.gray_filter_radius,
+                )
+                gc.collect()
+
+        if pending_clouds:
+            oldest_needed = pending_clouds[0][0] - max_time_delta_ns
+
+            while images and images[0][0] < oldest_needed:
+                images.popleft()
+
+    print("Merging and colouring registered frames (streaming, bounded memory)...")
+
+    with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
+        connections = [
+            connection
+            for connection in reader.connections
+            if connection.topic in topics
+        ]
+
+        for connection, timestamp, raw in tqdm(
+            reader.messages(connections=connections),
+            desc="Merging",
+        ):
+            try:
+                message = reader.deserialize(raw, connection.msgtype)
+
+                if connection.topic == args.camera_info_topic:
+                    candidate = intrinsics_from_camera_info(message)
+
+                    if candidate is not None:
+                        intrinsics = candidate
+
+                    continue
+
+                if connection.topic == args.camera_topic:
+                    image = convert_ros_image(message)
+
+                    if image is not None:
+                        images.append((timestamp, image))
+                        flush(timestamp)
+
+                    continue
+
+                if connection.topic != args.pc_topic:
+                    continue
+
+                transform = poses.get(timestamp)
+
+                if transform is None:
+                    continue
+
+                cloud = convert_ros_pc2_to_o3d(message)
+
+                if cloud is None or len(cloud.points) < args.min_frame_points:
+                    continue
+
+                cloud = cloud.voxel_down_sample(args.voxel_size)
+
+                if len(cloud.points) < args.min_frame_points:
+                    continue
+
+                cloud.transform(transform)
+
+                if odom_timestamps:
+                    closest_odom = get_closest_timestamp(
+                        timestamp,
+                        odom_timestamps,
+                    )
+
+                    if (
+                        closest_odom is not None
+                        and abs(closest_odom - timestamp)
+                        <= int(args.odom_max_latency * 1e9)
+                    ):
+                        attach_view_rays_as_normals(
+                            cloud,
+                            odom_data[closest_odom][:3, 3],
+                        )
+
+                pending_clouds.append((timestamp, cloud))
+                flush(timestamp)
+
+            except Exception:
+                continue
+
+    flush(0, final=True)
+
+    return _merge_chunk(
+        merged,
+        chunk,
+        args.voxel_size,
+        args.gray_filter_radius,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
 def run(args) -> None:
     bag_path = Path(args.bagpath)
-    out_dir  = Path(args.outputdir)
+    out_dir = Path(args.outputdir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not bag_path.exists():
         sys.exit(f"Error: Bag not found: {bag_path}")
 
-    required = [args.pc_topic] + ([args.odom_topic] if args.odom_topic else [])
-    if args.camera_topic:
-        required += [args.camera_topic, args.camera_info_topic]
+    required = [
+        args.pc_topic,
+        args.camera_topic,
+        args.camera_info_topic,
+    ] + ([args.odom_topic] if args.odom_topic else [])
+
     missing = check_topics(bag_path, required)
+
     if missing:
         sys.exit(f"Error: Required topics missing from bag: {missing}")
 
-    if args.camera_topic and not args.camera_info_topic:
-        sys.exit("Error: --camera_topic requires --camera_info_topic.")
+    frames, odom_data = _read_registration_data(bag_path, args)
 
-    topics = [args.pc_topic]
-    if args.odom_topic:    topics.append(args.odom_topic)
-    if args.camera_topic:  topics += [args.camera_topic, args.camera_info_topic]
-
-    pointclouds:   list = []
-    odom_data:     dict = {}
-    camera_images: dict = {}
-    cam_info_data: dict = {}
-
-    print(f"Reading: {bag_path}")
-    with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
-        conns = [c for c in reader.connections if c.topic in topics]
-        for conn, ts, raw in tqdm(reader.messages(connections=conns), desc="Reading"):
-            try:
-                msg = reader.deserialize(raw, conn.msgtype)
-                if conn.topic == args.pc_topic:
-                    pcd = convert_ros_pc2_to_o3d(msg)
-                    if pcd is not None and len(pcd.points) >= 100:
-                        pointclouds.append((ts, pcd))
-                elif args.odom_topic and conn.topic == args.odom_topic:
-                    T = get_odom_transform(msg)
-                    if T is not None: odom_data[ts] = T
-                elif args.camera_topic and conn.topic == args.camera_topic:
-                    img = convert_ros_image(msg)
-                    if img is not None: camera_images[ts] = img
-                elif args.camera_info_topic and conn.topic == args.camera_info_topic:
-                    intr = intrinsics_from_camera_info(msg)
-                    if intr is not None: cam_info_data[ts] = intr
-            except Exception:
-                continue
-
-    if not pointclouds:
+    if not frames:
         sys.exit("Error: No valid point clouds extracted.")
 
-    color_mode = bool(args.camera_topic and camera_images and cam_info_data)
-    intrinsics = None
-    if color_mode:
-        first_ts   = min(cam_info_data.keys())
-        intrinsics = cam_info_data[first_ts]
+    print(f"Registering {len(frames)} bounded point-cloud frames...")
 
-    odom_max_ns = int(args.odom_max_latency * 1e9)
-    posegraph, good_idx = run_icp_posegraph(pointclouds, odom_data, args)
-    odom_ts_sorted = sorted(odom_data.keys())
-    cam_ts_sorted  = sorted(camera_images.keys())
+    posegraph, good_indices = run_icp_posegraph(
+        frames,
+        odom_data,
+        args,
+    )
 
-    print("Merging registered frames...")
-    pcd_combined = o3d.geometry.PointCloud()
-    colored_frames = []
+    poses: dict[int, np.ndarray] = {}
 
-    for node_i, pc_i in enumerate(good_idx):
-        if node_i >= len(posegraph.nodes):
+    for node_index, frame_index in enumerate(good_indices):
+        if node_index >= len(posegraph.nodes):
             break
-        T_world = np.linalg.inv(posegraph.nodes[node_i].pose)
-        ts, pcd_raw = pointclouds[pc_i]
 
-        pcd_world = pcd_raw.voxel_down_sample(args.voxel_size)
-        pcd_world.transform(T_world)
+        if frame_index >= len(frames):
+            continue
 
-        if odom_ts_sorted:
-            cts = get_closest_timestamp(ts, odom_ts_sorted)
-            if cts and abs(cts - ts) < odom_max_ns:
-                attach_view_rays_as_normals(pcd_world, odom_data[cts][:3, 3])
-
-        if color_mode and cam_ts_sorted:
-            cam_ts = get_closest_timestamp(ts, cam_ts_sorted)
-            if cam_ts and abs(cam_ts - ts) < int(args.max_time_diff * 1e9):
-                cam_pose = odom_data.get(
-                    get_closest_timestamp(ts, odom_ts_sorted), np.eye(4)
-                ) if odom_ts_sorted else np.eye(4)
-                pcd_world = _color_pcd_from_image(
-                    pcd_world, camera_images[cam_ts], cam_pose,
-                    intrinsics, args.color_min_depth, args.color_max_depth,
-                )
-                colored_frames.append(pcd_world)
-                continue
-
-        pcd_combined += pcd_world
-
-    if color_mode and colored_frames:
-        print(f"Merging {len(colored_frames)} colored frames...")
-        merged_color = _merge_colored_pcds(
-            colored_frames, args.voxel_size, args.gray_filter_radius, args.workers
+        timestamp = frames[frame_index][0]
+        poses[timestamp] = np.linalg.inv(
+            posegraph.nodes[node_index].pose
         )
-        pcd_combined += merged_color
+
+    del frames
+    del posegraph
+    del good_indices
+    gc.collect()
+
+    if not poses:
+        sys.exit("Error: Registration produced no usable poses.")
+
+    pcd_combined = _stream_colored_merge(
+        bag_path,
+        args,
+        poses,
+        odom_data,
+        None,
+    )
+
+    del poses
+    del odom_data
+    gc.collect()
+
+    if not len(pcd_combined.points):
+        sys.exit("Error: No registered points were produced.")
 
     if args.level_floor:
         pcd_combined = level_floor(pcd_combined)
 
-    pcd_clean = clean_point_cloud(pcd_combined, args.voxel_size, do_voxel_downsample=False)
+    print("Cleaning merged cloud...")
+
+    pcd_clean = clean_point_cloud(
+        pcd_combined,
+        args.voxel_size,
+        do_voxel_downsample=False,
+    )
+
+    del pcd_combined
+    gc.collect()
+
     view_rays = (
         np.asarray(pcd_clean.normals, dtype=np.float64).copy()
-        if pcd_clean.has_normals() else None
+        if pcd_clean.has_normals()
+        else None
     )
-    estimate_geometric_normals_oriented(pcd_clean, args.voxel_size, view_rays)
+
+    estimate_geometric_normals_oriented(
+        pcd_clean,
+        args.voxel_size,
+        view_rays,
+    )
 
     print("Running Poisson reconstruction...")
+
     mesh = create_mesh(
         pcd_clean,
         poisson_depth=args.poisson_depth,
         min_density_percentile=args.min_density_percentile,
+        distance_multiplier=args.distance_multiplier,
         max_vertex_distance=args.max_vertex_distance,
+        remesh=args.remesh,
+        remesh_smooth_iterations=args.remesh_smooth_iterations,
         workers=args.workers,
         decimate_target=args.decimate_target,
+        curvature_percentile=args.curvature_percentile,
+        curvature_protect_rings=args.curvature_protect_rings,
     )
 
     stem = bag_path.stem
-    ply_path = out_dir / f"{stem}_cloud.ply"
-    obj_path = out_dir / f"{stem}_mesh.obj"
+    ply_path = out_dir / f"{stem}_colored_cloud.ply"
+    obj_path = out_dir / f"{stem}_colored_mesh.obj"
+
     o3d.io.write_point_cloud(str(ply_path), pcd_clean)
     o3d.io.write_triangle_mesh(str(obj_path), mesh)
+
     print(f"Saved cloud: {ply_path}")
-    print(f"Saved mesh:  {obj_path}")
+    print(f"Saved mesh: {obj_path}")
     print("Done.")
 
 
 def build_parser(sub):
-    p = sub.add_parser("color_mesh", help="ROS 2 bag -> colored Poisson mesh")
-    p.add_argument("bagpath");  p.add_argument("outputdir")
-    p.add_argument("--pc_topic",          default="points")
-    p.add_argument("--odom_topic",        default=None)
-    p.add_argument("--camera_topic",      default=None)
-    p.add_argument("--camera_info_topic", default=None)
-    p.add_argument("--camera_fx",   type=float, default=None)
-    p.add_argument("--camera_fy",   type=float, default=None)
-    p.add_argument("--camera_cx",   type=float, default=None)
-    p.add_argument("--camera_cy",   type=float, default=None)
-    p.add_argument("--camera_width",  type=int, default=None)
-    p.add_argument("--camera_height", type=int, default=None)
-    p.add_argument("--max_time_diff",      type=float, default=0.1)
-    p.add_argument("--voxel_size",         type=float, default=0.05)
-    p.add_argument("--icp_dist_thresh",    type=float, default=0.2)
-    p.add_argument("--icp_fitness_thresh", type=float, default=0.6)
-    p.add_argument("--odom_max_latency",   type=float, default=0.5)
-    p.add_argument("--enable_loop_closure",          action="store_true")
-    p.add_argument("--loop_closure_radius",          type=float, default=10.0)
-    p.add_argument("--loop_closure_fitness_thresh",  type=float, default=0.3)
-    p.add_argument("--loop_closure_search_interval", type=int,   default=10)
-    p.add_argument("--gray_filter_radius",    type=float, default=0.05)
-    p.add_argument("--color_min_depth",       type=float, default=0.1)
-    p.add_argument("--color_max_depth",       type=float, default=None)
-    p.add_argument("--poisson_depth",          type=int,   default=9)
-    p.add_argument("--min_density_percentile", type=float, default=1.0)
-    p.add_argument("--max_vertex_distance",    type=float, default=0.15)
-    p.add_argument("--decimate_target",        type=float, default=None)
-    p.add_argument("--level_floor",            action="store_true")
-    p.add_argument("--workers",                type=int,   default=4)
-    p.set_defaults(func=run)
-    return p
+    parser = sub.add_parser(
+        "color_mesh",
+        help="ROS 2 bag -> memory-bounded camera-coloured Poisson mesh",
+    )
+
+    parser.add_argument("bagpath", help="Path to the ROS 2 bag.")
+    parser.add_argument("outputdir", help="Output directory.")
+
+    parser.add_argument("--pc_topic", default="points")
+    parser.add_argument("--odom_topic", default=None)
+
+    parser.add_argument("--camera_topic", required=True)
+    parser.add_argument("--camera_info_topic", required=True)
+
+    parser.add_argument("--max_time_diff", type=float, default=0.1)
+    parser.add_argument("--color_min_depth", type=float, default=0.1)
+    parser.add_argument("--color_max_depth", type=float, default=None)
+    parser.add_argument("--gray_filter_radius", type=float, default=0.05)
+
+    parser.add_argument("--voxel_size", type=float, default=0.05)
+    parser.add_argument("--min_frame_points", type=int, default=100)
+
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=4,
+        help="Use every Nth cloud for registration and colouring.",
+    )
+
+    parser.add_argument(
+        "--max_registration_frames",
+        type=int,
+        default=0,
+        help="Maximum registration frames; 0 means unlimited.",
+    )
+
+    parser.add_argument(
+        "--merge_chunk_frames",
+        type=int,
+        default=16,
+        help="Frames merged before each voxel reduction.",
+    )
+
+    parser.add_argument("--icp_dist_thresh", type=float, default=0.2)
+    parser.add_argument("--icp_fitness_thresh", type=float, default=0.6)
+    parser.add_argument("--odom_max_latency", type=float, default=0.5)
+
+    parser.add_argument(
+        "--enable_loop_closure",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument("--loop_closure_radius", type=float, default=10.0)
+
+    parser.add_argument(
+        "--loop_closure_fitness_thresh",
+        type=float,
+        default=0.3,
+    )
+
+    parser.add_argument(
+        "--loop_closure_search_interval",
+        type=int,
+        default=10,
+    )
+
+    parser.add_argument(
+        "--poisson_depth",
+        type=int,
+        default=None,
+        help=(
+            "Omit for automatic depth selection capped at 11; "
+            "explicit depth 12+ is allowed."
+        ),
+    )
+
+    parser.add_argument(
+        "--min_density_percentile",
+        type=float,
+        default=1.0,
+    )
+
+    parser.add_argument(
+        "--distance_multiplier",
+        type=float,
+        default=3.0,
+    )
+
+    parser.add_argument(
+        "--max_vertex_distance",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--remesh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--remesh_smooth_iterations",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument("--decimate_target", type=float, default=None)
+
+    parser.add_argument(
+        "--curvature_percentile",
+        type=float,
+        default=80.0,
+    )
+
+    parser.add_argument(
+        "--curvature_protect_rings",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--level_floor",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument("--workers", type=int, default=1)
+
+    parser.set_defaults(func=run)
+    return parser

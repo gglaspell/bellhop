@@ -22,6 +22,8 @@ Pillow>=10.0.0
 # ── Georeferencing (tiles_3d + color_tiles_3d pipelines) ──────────────────
 pyproj>=3.5.0
 py3dtiles>=4.0.0
+pymeshlab>=2023.12
+pyfqmr>=0.2.0
 
 # ── Progress bars ─────────────────────────────────────────────────────────
 tqdm>=4.65.0
