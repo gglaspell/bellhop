@@ -19,6 +19,8 @@
   - [tiles_3d — Cesium 3D Tiles](#tiles_3d--cesium-3d-tiles)
   - [color_tiles_3d — Colored Cesium 3D Tiles](#color_tiles_3d--colored-cesium-3d-tiles)
 - [Shared parameters](#shared-parameters)
+  - [Registration](#registration)
+  - [Reconstruction](#reconstruction)
 - [Pre-flight topic check](#pre-flight-topic-check)
 - [Running without Docker](#running-without-docker)
 - [Per-pipeline documentation](#per-pipeline-documentation)
@@ -108,7 +110,7 @@ docker run --rm \
     --odom_topic /dlio/odom_node/odom
 ```
 
-**Example — Poisson mesh:**
+**Example — Poisson mesh (with stride and memory controls):**
 
 ```bash
 docker run --rm \
@@ -116,7 +118,9 @@ docker run --rm \
   -v ~/output:/data/output \
   bellhop:latest mesh /data/bag /data/output \
     --pc_topic /points \
-    --voxel_size 0.05
+    --voxel_size 0.05 \
+    --frame_stride 4 \
+    --max_registration_frames 500
 ```
 
 **Example — georeferenced 3D Tiles:**
@@ -235,13 +239,15 @@ Produces a Nav2-compatible `.pgm` image and `.yaml` map file from a LiDAR scan.
 | `--pc_topic` | `/dlio/odom_node/pointcloud/deskewed` | PointCloud2 topic |
 | `--odom_topic` | `/dlio/odom_node/odom` | Odometry topic |
 | `--octree_res` | `0.1` | 3D OcTree resolution (m) |
-| `--grid_res` | `0.05` | 2D grid resolution (m) |
+| `--grid_res` | `0.10` | 2D grid resolution (m) |
 | `--slope_deg` | `15.0` | Max slope angle (°) for ground classification |
 | `--normal_radius` | `0.2` | Normal estimation radius (m) |
 | `--z_min` | `0.1` | Min obstacle height above ground (m) |
 | `--z_max` | `2.0` | Max obstacle height above ground (m) |
 | `--voxel_size` | `0.05` | Voxel downsampling size (m); `0` disables |
 | `--odom_max_latency` | `0.5` | Max tolerated timestamp gap between odom and cloud (s) |
+| `--frame_stride` | `1` | Use every Nth cloud frame; `1` uses all frames |
+| `--max_frames` | `0` | Maximum frames to process; `0` means unlimited |
 | `--min_cluster_size` | `20` | Minimum obstacle cluster size (cells); `0` disables |
 | `--closing_iters` | `1` | Morphological closing iterations |
 | `--workers` | `4` | Parallel worker threads |
@@ -252,7 +258,7 @@ Produces a Nav2-compatible `.pgm` image and `.yaml` map file from a LiDAR scan.
 
 ### mesh — Poisson Surface Mesh
 
-Registers LiDAR frames with ICP, merges them into a world-frame cloud, and runs Poisson surface reconstruction.
+Registers LiDAR frames with ICP, merges them into a world-frame cloud, and runs Poisson surface reconstruction. Uses a two-pass streaming merge to keep memory usage bounded regardless of bag size.
 
 **Required topics:** PointCloud2. Odometry is optional but improves registration.
 
@@ -260,12 +266,13 @@ Registers LiDAR frames with ICP, merges them into a world-frame cloud, and runs 
 |---|---|---|
 | `--pc_topic` | `points` | PointCloud2 topic |
 | `--odom_topic` | _(none)_ | Odometry topic (optional) |
-| `--voxel_size` | `0.05` | Voxel downsampling size (m) |
-| `--poisson_depth` | `9` | Poisson octree depth (higher = finer, slower) |
-| `--min_density_percentile` | `1.0` | Percentile of low-density vertices to trim |
-| `--max_vertex_distance` | `0.15` | Max vertex distance from input cloud (m) |
-| `--decimate_target` | _(none)_ | Triangle count target (`< 1.0` = fraction; `≥ 1` = absolute; blank = skip) |
-| `--level_floor` | _(off)_ | Rotate cloud so dominant ground plane is horizontal |
+| `--voxel_size` | `0.10` | Voxel downsampling size (m) |
+| `--min_frame_points` | `100` | Skip frames with fewer points than this |
+| `--frame_stride` | `1` | Use every Nth cloud for registration and merging |
+| `--max_registration_frames` | `500` | Maximum frames retained for ICP registration; `0` means unlimited |
+| `--merge_chunk_frames` | `16` | Frames merged per batch before each voxel reduction |
+
+All [shared registration](#registration) and [shared reconstruction](#reconstruction) options also apply.
 
 **Outputs:** `<stem>_cloud.ply`, `<stem>_mesh.obj`
 
@@ -299,7 +306,7 @@ Produces a Gazebo-ready static mesh (STL) plus `.sdf`, `model.config`, and `.wor
 | Option | Default | Description |
 |---|---|---|
 | `--model_name` | `bag_environment` | Gazebo model name |
-| `--gazebo_material` | `Gazebo/Grey` | Gazebo material string (e.g. `Gazebo/White`, `Gazebo/Wood`) |
+| `--gazebo_material` | `Gazebo/Grey` | Gazebo material string (e.g. `Gazebo/White`, `Gazebo/Wood`, `Gazebo/Bricks`, `Gazebo/Grass`) |
 | `--level_floor` | _(off)_ | Level the mesh to the ground plane before export |
 
 All `mesh` registration and reconstruction options also apply.
@@ -345,6 +352,8 @@ All `tiles_3d` and `color_mesh` options apply.
 
 ## 🗘 Shared parameters
 
+### Registration
+
 These options are accepted by all pipelines that run ICP registration (`mesh`, `color_mesh`, `gazebo_world`, `tiles_3d`, `color_tiles_3d`):
 
 | Option | Default | Description |
@@ -353,11 +362,33 @@ These options are accepted by all pipelines that run ICP registration (`mesh`, `
 | `--icp_dist_thresh` | `0.2` | ICP max correspondence distance (m) |
 | `--icp_fitness_thresh` | `0.6` | ICP fitness score threshold; frames below this are skipped |
 | `--odom_max_latency` | `0.5` | Max timestamp gap between odometry and cloud (s) |
+| `--frame_stride` | `4` | Register every Nth input frame; `1` (or `0`) uses all frames |
+| `--max_registration_frames` | `0` | Cap on frames passed to ICP after stride selection; `0` = unlimited |
+| `--merge_chunk_frames` | `16` | Frames merged per batch before each voxel reduction in the streaming merge pass |
 | `--enable_loop_closure` | _(off)_ | Enable pose-graph loop closure |
 | `--loop_closure_radius` | `10.0` | Spatial search radius for loop closure candidates (m) |
 | `--loop_closure_fitness_thresh` | `0.3` | Fitness threshold for accepting a loop closure edge |
 | `--loop_closure_search_interval` | `10` | Check every N frames for loop closure candidates |
 | `--workers` | `4` | Parallel worker threads |
+
+> **Frame selection order:** frames are first thinned by `--frame_stride`, then capped by `--max_registration_frames`. The full (un-strided) frame list is used during the subsequent streaming merge pass, so merging is always complete regardless of stride.
+
+### Reconstruction
+
+These options control Poisson reconstruction and mesh post-processing for `mesh`, `color_mesh`, and `gazebo_world`:
+
+| Option | Default | Description |
+|---|---|---|
+| `--poisson_depth` | _(Auto)_ | Poisson octree depth; omit for automatic selection capped at 11. Explicit depths ≥ 12 are permitted. |
+| `--min_density_percentile` | `1.0` | Percentile of low-density vertices to trim after Poisson |
+| `--distance_multiplier` | `3.0` | Adaptive trim threshold = this multiplier × mean point spacing (m); `0` disables adaptive trim |
+| `--max_vertex_distance` | _(none)_ | Hard cap on vertex distance from input cloud (m); blank = unlimited |
+| `--remesh` | `True` | Run isotropic remeshing + Laplacian smoothing (requires `pymeshlab`); pass `--no-remesh` to skip |
+| `--remesh_smooth_iterations` | `5` | Laplacian smoothing iterations applied during remeshing |
+| `--decimate_target` | _(none)_ | Triangle count target: `< 1.0` = fraction of current count; `≥ 1` = absolute count; blank = skip |
+| `--curvature_percentile` | `80.0` | Protect the top N% of high-curvature faces from decimation |
+| `--curvature_protect_rings` | `1` | Dilation rings added around protected high-curvature faces |
+| `--level_floor` | _(off)_ | Rotate cloud so dominant ground plane is horizontal before reconstruction |
 
 ---
 
@@ -401,6 +432,8 @@ pip install -r requirements.txt
 > ```bash
 > sudo apt install liboctomap-dev
 > ```
+>
+> `--remesh` requires `pymeshlab` and `--decimate_target` requires `pyfqmr`. Both are included in `requirements.txt`.
 
 Run any pipeline:
 ```bash
