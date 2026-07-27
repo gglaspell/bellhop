@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ROS 2 bag -> registered, memory-bounded Poisson mesh (.ply + .obj)."""
+"""ROS 2 bag -> registered, memory-bounded Poisson mesh."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import open3d as o3d
 from rosbags.highlevel import AnyReader
 from tqdm import tqdm
 
+from .shared.mesh_utils import apply_height_colormap
 from .shared.preflight import check_topics
 from .shared.reconstruction import clean_point_cloud, create_mesh, level_floor
 from .shared.registration import (
@@ -28,14 +29,21 @@ from .shared.ros_io import (
 )
 
 
-def _read_registration_data(bag_path: Path, args):
-    """Read bounded, voxelized registration frames and odometry."""
-    topics = [args.pc_topic] + ([args.odom_topic] if args.odom_topic else [])
+def _read_registration_data(
+    bag_path: Path,
+    args: argparse.Namespace,
+) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], dict[int, np.ndarray]]:
+    """Read bounded, voxelized registration frames and optional odometry."""
+    topics = [args.pc_topic]
+    if args.odom_topic:
+        topics.append(args.odom_topic)
+
     frames: list[tuple[int, o3d.geometry.PointCloud]] = []
     odom_data: dict[int, np.ndarray] = {}
+
     seen_clouds = 0
     stride = max(1, int(args.frame_stride))
-    limit = int(args.max_registration_frames) if args.max_registration_frames else 0
+    limit = max(0, int(args.max_registration_frames))
 
     print(f"Reading registration frames: {bag_path}")
 
@@ -53,7 +61,7 @@ def _read_registration_data(bag_path: Path, args):
             try:
                 message = reader.deserialize(raw, connection.msgtype)
 
-                if connection.topic == args.odom_topic:
+                if args.odom_topic and connection.topic == args.odom_topic:
                     transform = get_odom_transform(message)
                     if transform is not None:
                         odom_data[timestamp] = transform
@@ -63,17 +71,14 @@ def _read_registration_data(bag_path: Path, args):
                     continue
 
                 seen_clouds += 1
-
                 if (seen_clouds - 1) % stride:
                     continue
 
                 cloud = convert_ros_pc2_to_o3d(message)
-
                 if cloud is None or len(cloud.points) < args.min_frame_points:
                     continue
 
                 cloud = cloud.voxel_down_sample(args.voxel_size)
-
                 if len(cloud.points) < args.min_frame_points:
                     continue
 
@@ -94,12 +99,11 @@ def _append_chunk(
     chunk: list[o3d.geometry.PointCloud],
     voxel_size: float,
 ) -> o3d.geometry.PointCloud:
-    """Merge one short chunk and voxelize immediately to bound memory."""
+    """Merge a bounded chunk and immediately downsample it."""
     if not chunk:
         return target
 
     local = o3d.geometry.PointCloud()
-
     for cloud in chunk:
         local += cloud
 
@@ -110,17 +114,16 @@ def _append_chunk(
     else:
         target = local
 
-    # Repeated reduction prevents the merged cloud from growing without bound.
     return target.voxel_down_sample(voxel_size)
 
 
 def _merge_registered_frames(
     bag_path: Path,
-    args,
+    args: argparse.Namespace,
     pose_by_timestamp: dict[int, np.ndarray],
     odom_data: dict[int, np.ndarray],
 ) -> o3d.geometry.PointCloud:
-    """Second pass: transform one cloud at a time, then discard it."""
+    """Stream registered clouds during a second bag pass."""
     odom_timestamps = sorted(odom_data)
     merged = o3d.geometry.PointCloud()
     chunk: list[o3d.geometry.PointCloud] = []
@@ -140,7 +143,6 @@ def _merge_registered_frames(
             desc="Merging",
         ):
             transform = pose_by_timestamp.get(timestamp)
-
             if transform is None:
                 continue
 
@@ -152,7 +154,6 @@ def _merge_registered_frames(
                     continue
 
                 cloud = cloud.voxel_down_sample(args.voxel_size)
-
                 if len(cloud.points) < args.min_frame_points:
                     continue
 
@@ -160,7 +161,6 @@ def _merge_registered_frames(
 
                 if odom_timestamps:
                     closest = get_closest_timestamp(timestamp, odom_timestamps)
-
                     if (
                         closest is not None
                         and abs(closest - timestamp)
@@ -187,7 +187,8 @@ def _merge_registered_frames(
     return _append_chunk(merged, chunk, args.voxel_size)
 
 
-def run(args) -> None:
+def run(args: argparse.Namespace) -> None:
+    """Run registration, reconstruction, and optional height-color export."""
     bag_path = Path(args.bagpath)
     out_dir = Path(args.outputdir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -195,39 +196,32 @@ def run(args) -> None:
     if not bag_path.exists():
         sys.exit(f"Error: Bag not found: {bag_path}")
 
-    required = [args.pc_topic] + (
-        [args.odom_topic] if args.odom_topic else []
-    )
-    missing = check_topics(bag_path, required)
+    required = [args.pc_topic]
+    if args.odom_topic:
+        required.append(args.odom_topic)
 
+    missing = check_topics(bag_path, required)
     if missing:
         sys.exit(f"Error: Required topics missing from bag: {missing}")
 
     frames, odom_data = _read_registration_data(bag_path, args)
-
     if not frames:
         sys.exit("Error: No valid point clouds extracted.")
 
     if args.odom_topic and not odom_data:
         print(
-            "Warning: odom topic set but no usable messages were found; "
-            "using ICP-only guesses."
+            "Warning: odom topic was set but no usable messages were found; "
+            "using ICP-only initial guesses."
         )
 
     print(f"Registering {len(frames)} bounded point-cloud frames...")
-    posegraph, good_indices = run_icp_posegraph(
-        frames,
-        odom_data,
-        args,
-    )
+    posegraph, good_indices = run_icp_posegraph(frames, odom_data, args)
 
-    # `good_indices` and posegraph nodes are parallel in the registration API.
     pose_by_timestamp: dict[int, np.ndarray] = {}
 
     for node_index, frame_index in enumerate(good_indices):
         if node_index >= len(posegraph.nodes):
             break
-
         if frame_index >= len(frames):
             continue
 
@@ -236,7 +230,6 @@ def run(args) -> None:
             posegraph.nodes[node_index].pose
         )
 
-    # Release all registration geometry before the streaming merge pass.
     del frames
     del posegraph
     del good_indices
@@ -259,11 +252,11 @@ def run(args) -> None:
     if not len(pcd_combined.points):
         sys.exit("Error: No registered points were produced.")
 
-    print("Cleaning merged cloud...")
-
     if args.level_floor:
+        print("Levelling dominant floor plane...")
         pcd_combined = level_floor(pcd_combined)
 
+    print("Cleaning merged cloud...")
     pcd_clean = clean_point_cloud(
         pcd_combined,
         args.voxel_size,
@@ -286,7 +279,6 @@ def run(args) -> None:
     )
 
     print("Running Poisson reconstruction...")
-
     mesh = create_mesh(
         pcd_clean,
         poisson_depth=args.poisson_depth,
@@ -302,21 +294,58 @@ def run(args) -> None:
     )
 
     stem = bag_path.stem
-    ply_path = out_dir / f"{stem}_cloud.ply"
-    obj_path = out_dir / f"{stem}_mesh.obj"
+    cloud_path = out_dir / f"{stem}_cloud.ply"
+    mesh_ply_path = out_dir / f"{stem}_mesh.ply"
+    mesh_obj_path = out_dir / f"{stem}_mesh.obj"
 
-    o3d.io.write_point_cloud(str(ply_path), pcd_clean)
-    o3d.io.write_triangle_mesh(str(obj_path), mesh)
+    o3d.io.write_point_cloud(str(cloud_path), pcd_clean)
+    o3d.io.write_triangle_mesh(
+        str(mesh_ply_path),
+        mesh,
+        write_vertex_normals=True,
+    )
+    o3d.io.write_triangle_mesh(
+        str(mesh_obj_path),
+        mesh,
+        write_vertex_normals=True,
+    )
 
-    print(f"Saved cloud: {ply_path}")
-    print(f"Saved mesh: {obj_path}")
+    print(f"Saved cloud: {cloud_path}")
+    print(f"Saved mesh PLY: {mesh_ply_path}")
+    print(f"Saved mesh OBJ: {mesh_obj_path}")
+
+    if args.height_colormap:
+        colored_obj_path = out_dir / (
+            f"{stem}_height_{args.height_colormap}.obj"
+        )
+
+        print(
+            f"Applying {args.height_colormap} height false-color "
+            "texture..."
+        )
+
+        colored_obj, texture_path = apply_height_colormap(
+            mesh_ply_path,
+            colored_obj_path,
+            colormap=args.height_colormap,
+            texture_size=args.height_texture_size,
+        )
+
+        print(f"Saved false-color OBJ: {colored_obj}")
+        print(f"Saved false-color texture: {texture_path}")
+        print(
+            f"Saved false-color material: "
+            f"{colored_obj.with_suffix('.mtl')}"
+        )
+
     print("Done.")
 
 
 def build_parser(sub):
+    """Register the mesh subcommand."""
     parser = sub.add_parser(
         "mesh",
-        help="ROS 2 bag -> memory-bounded Poisson mesh (.ply + .obj)",
+        help="ROS 2 bag -> memory-bounded Poisson mesh",
     )
 
     parser.add_argument("bagpath", help="Path to the ROS 2 bag.")
@@ -334,14 +363,12 @@ def build_parser(sub):
         default=1,
         help="Use every Nth cloud for registration and merging.",
     )
-
     parser.add_argument(
         "--max_registration_frames",
         type=int,
         default=500,
         help="Maximum retained registration frames; 0 means unlimited.",
     )
-
     parser.add_argument(
         "--merge_chunk_frames",
         type=int,
@@ -358,14 +385,12 @@ def build_parser(sub):
         action="store_true",
         default=False,
     )
-
     parser.add_argument("--loop_closure_radius", type=float, default=10.0)
     parser.add_argument(
         "--loop_closure_fitness_thresh",
         type=float,
         default=0.3,
     )
-
     parser.add_argument(
         "--loop_closure_search_interval",
         type=int,
@@ -381,19 +406,16 @@ def build_parser(sub):
             "explicit depth 12+ is allowed."
         ),
     )
-
     parser.add_argument(
         "--min_density_percentile",
         type=float,
         default=1.0,
     )
-
     parser.add_argument(
         "--distance_multiplier",
         type=float,
         default=3.0,
     )
-
     parser.add_argument(
         "--max_vertex_distance",
         type=float,
@@ -405,31 +427,42 @@ def build_parser(sub):
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-
     parser.add_argument(
         "--remesh_smooth_iterations",
         type=int,
         default=5,
     )
-
     parser.add_argument("--decimate_target", type=float, default=None)
-
     parser.add_argument(
         "--curvature_percentile",
         type=float,
         default=80.0,
     )
-
     parser.add_argument(
         "--curvature_protect_rings",
         type=int,
         default=1,
     )
-
     parser.add_argument(
         "--level_floor",
         action="store_true",
         default=False,
+    )
+
+    parser.add_argument(
+        "--height_colormap",
+        choices=("jet", "hot", "cool", "gray"),
+        default=None,
+        help=(
+            "Also export a textured false-color OBJ, MTL, and PNG bundle "
+            "whose color represents mesh height."
+        ),
+    )
+    parser.add_argument(
+        "--height_texture_size",
+        type=int,
+        default=1024,
+        help="Height-color texture lookup-table size in pixels.",
     )
 
     parser.add_argument("--workers", type=int, default=2)

@@ -122,6 +122,23 @@ _COMMON_RECONSTRUCTION = [
     ("level_floor", "Level floor", "check", False, {}),
 ]
 
+_HEIGHT_FALSE_COLOR = [
+    (
+        "height_colormap",
+        "Height false-color",
+        "combobox",
+        "Off",
+        {"values": ["Off", "jet", "hot", "cool", "gray"]},
+    ),
+    (
+        "height_texture_size",
+        "Height texture size (px)",
+        "combobox",
+        "1024",
+        {"values": ["256", "512", "1024", "2048", "4096"]},
+    ),
+]
+
 _COMMON_TOPICS = [
     ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
     ("odom_topic", "Odometry topic", "entry", "", {}),
@@ -213,12 +230,16 @@ PROFILES = {
     },
     "Mesh": {
         "pipeline": "mesh",
-        "description": "Poisson surface mesh → .ply + .obj",
+        "description": (
+            "Poisson surface mesh -> .ply + .obj; "
+            "optional height-coloured OBJ + MTL + PNG"
+        ),
         "required_topics_fields": ["pc_topic"],
         "params": (
             _COMMON_TOPICS
             + _COMMON_REGISTRATION
             + _COMMON_RECONSTRUCTION
+            + _HEIGHT_FALSE_COLOR
         ),
     },
     "Color Mesh": {

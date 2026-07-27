@@ -271,10 +271,18 @@ Registers LiDAR frames with ICP, merges them into a world-frame cloud, and runs 
 | `--frame_stride` | `1` | Use every Nth cloud for registration and merging |
 | `--max_registration_frames` | `500` | Maximum frames retained for ICP registration; `0` means unlimited |
 | `--merge_chunk_frames` | `16` | Frames merged per batch before each voxel reduction |
+| `--height_colormap` | _(none)_ | Also export a textured height false-color OBJ bundle; choices: `jet`, `hot`, `cool`, `gray` |
+| `--height_texture_size` | `1024` | Height lookup texture size in pixels |
 
 All [shared registration](#registration) and [shared reconstruction](#reconstruction) options also apply.
 
-**Outputs:** `<stem>_cloud.ply`, `<stem>_mesh.obj`
+**Outputs:** `<stem>_cloud.ply`, `<stem>_mesh.ply`, `<stem>_mesh.obj`.
+
+When `--height_colormap` is selected, Bellhop also writes:
+
+- `<stem>_height_<colormap>.obj`
+- `<stem>_height_<colormap>.mtl`
+- `<stem>_height_<colormap>_texture.png`
 
 ---
 
