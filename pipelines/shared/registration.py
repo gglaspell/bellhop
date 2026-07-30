@@ -8,15 +8,27 @@ NOT used by: og_map (uses OcTree ray-casting instead).
 Registration controls
 ---------------------
 --frame_stride:
-    Register every Nth input PointCloud2 frame. Values <= 1 mean all frames.
+Register every Nth input PointCloud2 frame. Values <= 1 mean all frames.
 
 --max_registration_frames:
-    Limit the number of frames after stride selection. 0 means no limit.
+Limit the number of frames after stride selection. 0 means no limit.
 
 --merge_chunk_frames:
-    Used by iter_registered_frame_chunks() to process successful registered
-    frame indices in bounded batches during pipeline-side merging. This avoids
-    keeping a large temporary merge batch alive at once.
+Used by iter_registered_frame_chunks() to process successful registered
+frame indices in bounded batches during pipeline-side merging. This avoids
+keeping a large temporary merge batch alive at once.
+
+PATCH NOTE (loop-closure information weighting)
+------------------------------------------------
+Previously, loop-closure edges were assigned an information matrix scaled
+by `fitness * 100.0`, making them roughly 100x more "trusted" than a
+sequential ICP edge with an equivalent fitness score. Because loop closures
+are accepted at a much lower fitness bar than sequential ICP edges (0.3
+default vs 0.6 default), this let mediocre or occasionally incorrect loop
+matches dominate the global pose-graph optimization and warp the whole
+trajectory. The fix below removes the artificial 100x multiplier so loop
+edges are weighted on the same scale as sequential edges, proportional only
+to their own measured fitness.
 """
 
 from __future__ import annotations
@@ -90,7 +102,7 @@ def select_registration_frames(
     original_indices = list(range(0, len(pointclouds), stride))
 
     if max_registration_frames > 0:
-        original_indices = original_indices[:int(max_registration_frames)]
+        original_indices = original_indices[: int(max_registration_frames)]
 
     if len(original_indices) < 2:
         raise RuntimeError(
@@ -121,7 +133,7 @@ def iter_registered_frame_chunks(
         chunk_size = len(successful_original_indices)
 
     for start in range(0, len(successful_original_indices), chunk_size):
-        yield successful_original_indices[start:start + chunk_size]
+        yield successful_original_indices[start : start + chunk_size]
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +586,7 @@ def run_icp_posegraph(
             np.eye(6, dtype=np.float64)
             * max(float(registration.fitness), 1e-6)
         )
+
         posegraph.edges.append(
             o3d.pipelines.registration.PoseGraphEdge(
                 len(posegraph.nodes) - 2,
@@ -617,10 +630,18 @@ def run_icp_posegraph(
                 )
 
                 for candidate_idx, transform, fitness in closures:
+                    # PATCHED: removed the previous "* 100.0" multiplier.
+                    # Loop-closure edges are now weighted on the SAME scale
+                    # as sequential ICP edges -- proportional only to their
+                    # own measured fitness, not artificially inflated 100x.
+                    # This prevents a single mediocre/incorrect loop match
+                    # from dominating the global pose-graph optimisation
+                    # and warping the whole trajectory.
                     loop_information = (
                         np.eye(6, dtype=np.float64)
-                        * max(fitness * 100.0, 1e-6)
+                        * max(fitness, 1e-6)
                     )
+
                     posegraph.edges.append(
                         o3d.pipelines.registration.PoseGraphEdge(
                             candidate_idx,
