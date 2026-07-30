@@ -10,7 +10,6 @@ import numpy as np
 import open3d as o3d
 from PIL import Image
 
-
 _VALID_COLORMAPS = {"jet", "hot", "cool", "gray"}
 
 
@@ -85,19 +84,23 @@ def _write_obj(
     vertex_indices = np.asarray(faces, dtype=np.int32) + 1
     uv_indices = np.arange(face_count, dtype=np.int32) * 3 + 1
 
-    face_rows = np.column_stack(
-        (
-            vertex_indices[:, 0],
-            uv_indices,
-            vertex_indices[:, 0],
-            vertex_indices[:, 1],
-            uv_indices + 1,
-            vertex_indices[:, 1],
-            vertex_indices[:, 2],
-            uv_indices + 2,
-            vertex_indices[:, 2],
-        )
-    )
+    # FIX: np.column_stack() accepts a single sequence argument (a tuple or
+    # list of the columns to stack), not multiple bare positional arguments.
+    # The previous call passed nine separate positional args -- e.g.
+    # np.column_stack(vertex_indices[:, 0], uv_indices, ...) -- which raises
+    # `TypeError: column_stack() takes 1 positional argument but 9 were
+    # given`. Wrapping all nine arrays in a single tuple fixes this.
+    face_rows = np.column_stack((
+        vertex_indices[:, 0],
+        uv_indices,
+        vertex_indices[:, 0],
+        vertex_indices[:, 1],
+        uv_indices + 1,
+        vertex_indices[:, 1],
+        vertex_indices[:, 2],
+        uv_indices + 2,
+        vertex_indices[:, 2],
+    ))
 
     np.savetxt(
         buffer,
@@ -196,12 +199,14 @@ def apply_height_colormap(
     texture_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(texture_array, mode="RGB").save(texture_path)
 
-    vertex_uvs = np.column_stack(
-        (
-            np.full(len(normalized_heights), 0.5, dtype=np.float64),
-            normalized_heights,
-        )
-    )
+    # FIX: same np.column_stack() positional-args bug as in _write_obj().
+    # Wrap the two UV columns in a tuple so column_stack receives a single
+    # sequence argument instead of two bare positional args.
+    vertex_uvs = np.column_stack((
+        np.full(len(normalized_heights), 0.5, dtype=np.float64),
+        normalized_heights,
+    ))
+
     flat_uvs = vertex_uvs[faces].reshape(-1, 2)
 
     mtl_path = output_obj_path.with_suffix(".mtl")

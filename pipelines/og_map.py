@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-og_map.py – ROS 2 bag -> Nav2 occupancy grid.
+og_map.py - ROS 2 bag -> Nav2 occupancy grid.
 
 This preserves the validated hybrid method:
 - build an OcTree using ray casting
@@ -12,6 +12,8 @@ This preserves the validated hybrid method:
 from __future__ import annotations
 
 import bisect
+import logging
+import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,6 +33,8 @@ from .shared.ros_io import (
     get_odom_transform_matrix,
     pointcloud2_to_numpy,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _nearest_index(
@@ -65,7 +69,7 @@ def _separate_ground_and_obstacles(
     voxel_size: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Separate ground and non-ground points using surface-normal slope."""
-    print("Separating ground from obstacles...")
+    logger.info("Separating ground from obstacles...")
 
     if len(cloud.points) < 3:
         return np.empty((0, 3)), np.asarray(cloud.points)
@@ -83,15 +87,15 @@ def _separate_ground_and_obstacles(
                 max_nn=30,
             )
         )
-
         downsampled.orient_normals_to_align_with_direction(
             [0.0, 0.0, 1.0]
         )
-
-    except Exception as exc:
-        print(
-            f" Warning: normal estimation failed ({exc}); "
-            "treating all points as obstacles."
+    except RuntimeError as exc:
+        # Open3D raises RuntimeError on a degenerate KDTree (e.g. too few
+        # neighbors within normal_radius for a sparse/downsampled cloud).
+        logger.warning(
+            "Normal estimation failed (%s); treating all points as obstacles.",
+            exc,
         )
         return np.empty((0, 3)), np.asarray(cloud.points)
 
@@ -122,9 +126,9 @@ def _separate_ground_and_obstacles(
     ground_points = points[ground_mask]
     obstacle_points = points[~ground_mask]
 
-    print(
-        f" Ground: {len(ground_points)} pts | "
-        f"Obstacles: {len(obstacle_points)} pts"
+    logger.info(
+        "Ground: %d pts | Obstacles: %d pts",
+        len(ground_points), len(obstacle_points),
     )
 
     return ground_points, obstacle_points
@@ -138,10 +142,10 @@ def _build_ground_height_map(
     y_size: int,
 ) -> np.ndarray:
     """Build a local ground-height image and fill missing cells."""
-    print("Building ground height map...")
+    logger.info("Building ground height map...")
 
     if len(ground_points) == 0:
-        print(" Warning: no ground points; using a Z=0 ground plane.")
+        logger.warning("No ground points; using a Z=0 ground plane.")
         return np.zeros((y_size, x_size), dtype=np.float64)
 
     sum_z = np.zeros((y_size, x_size), dtype=np.float64)
@@ -169,7 +173,6 @@ def _build_ground_height_map(
         (grid_y[valid], grid_x[valid]),
         ground_points[valid, 2],
     )
-
     np.add.at(
         counts,
         (grid_y[valid], grid_x[valid]),
@@ -191,7 +194,7 @@ def _build_ground_height_map(
             float(ground_points[:, 2].min()),
         )
 
-    print(" Interpolating gaps in ground height map...")
+    logger.info("Interpolating gaps in ground height map...")
 
     yy, xx = np.mgrid[0:y_size, 0:x_size]
 
@@ -201,6 +204,77 @@ def _build_ground_height_map(
         (yy, xx),
         method="nearest",
     )
+
+
+def _process_row_block(
+    row_start: int,
+    row_end: int,
+    x_size: int,
+    ground_height_map: np.ndarray,
+    obstacle_tree,
+    grid_resolution: float,
+    map_origin: np.ndarray,
+    relative_z_min: float,
+    relative_z_max: float,
+    sample_count: int,
+) -> tuple[int, np.ndarray]:
+    """
+    Compute occupancy values for a contiguous block of grid rows
+    [row_start, row_end) in a single thread.
+
+    Batching by row-block (instead of submitting one ThreadPoolExecutor
+    task per individual grid cell) keeps the number of futures bounded
+    by the worker count rather than by x_size * y_size, which avoids
+    exhausting memory/threads on large grids while still parallelising
+    across the OcTree queries.
+    """
+    block_height = row_end - row_start
+    block = np.full((block_height, x_size), 127, dtype=np.uint8)
+
+    for local_y, grid_y in enumerate(range(row_start, row_end)):
+        for grid_x in range(x_size):
+            ground_z = ground_height_map[grid_y, grid_x]
+
+            if not np.isfinite(ground_z):
+                continue
+
+            world_x = map_origin[0] + (grid_x + 0.5) * grid_resolution
+            world_y = map_origin[1] + (grid_y + 0.5) * grid_resolution
+
+            z_slice = np.linspace(
+                ground_z + relative_z_min,
+                ground_z + relative_z_max,
+                sample_count,
+            )
+
+            free_evidence = False
+
+            for world_z in z_slice:
+                node = obstacle_tree.search(
+                    np.array(
+                        [world_x, world_y, world_z],
+                        dtype=np.float64,
+                    )
+                )
+
+                if node is None:
+                    continue
+
+                if (
+                    node.getOccupancy()
+                    >= obstacle_tree.getOccupancyThres()
+                ):
+                    block[local_y, grid_x] = 0
+                    free_evidence = False
+                    break
+
+                free_evidence = True
+
+            else:
+                if free_evidence:
+                    block[local_y, grid_x] = 254
+
+    return row_start, block
 
 
 def _create_hybrid_occupancy_grid(
@@ -216,15 +290,13 @@ def _create_hybrid_occupancy_grid(
     Query OcTree occupancy in a vertical band above each ground cell.
 
     Values:
-      0   occupied
-      127 unknown
-      254 free
+        0   occupied
+        127 unknown
+        254 free
     """
     y_size, x_size = ground_height_map.shape
 
-    print(f"Generating 2D occupancy grid ({x_size} x {y_size})...")
-
-    grid = np.full((y_size, x_size), 127, dtype=np.uint8)
+    logger.info("Generating 2D occupancy grid (%d x %d)...", x_size, y_size)
 
     sample_count = max(
         7,
@@ -237,60 +309,36 @@ def _create_hybrid_occupancy_grid(
         + 1,
     )
 
-    def process_cell(
-        grid_y: int,
-        grid_x: int,
-    ) -> tuple[int, int, int]:
-        ground_z = ground_height_map[grid_y, grid_x]
+    worker_count = max(1, workers)
 
-        if not np.isfinite(ground_z):
-            return grid_y, grid_x, 127
+    grid = np.full((y_size, x_size), 127, dtype=np.uint8)
 
-        world_x = map_origin[0] + (grid_x + 0.5) * grid_resolution
-        world_y = map_origin[1] + (grid_y + 0.5) * grid_resolution
+    blocks_per_worker = 4
+    num_blocks = max(1, min(y_size, worker_count * blocks_per_worker))
+    row_boundaries = np.linspace(0, y_size, num_blocks + 1, dtype=np.int64)
+    row_boundaries = np.unique(row_boundaries)
 
-        z_slice = np.linspace(
-            ground_z + relative_z_min,
-            ground_z + relative_z_max,
-            sample_count,
-        )
-
-        free_evidence = False
-
-        for world_z in z_slice:
-            node = obstacle_tree.search(
-                np.array(
-                    [world_x, world_y, world_z],
-                    dtype=np.float64,
-                )
-            )
-
-            if node is None:
-                continue
-
-            if (
-                node.getOccupancy()
-                >= obstacle_tree.getOccupancyThres()
-            ):
-                return grid_y, grid_x, 0
-
-            free_evidence = True
-
-        if free_evidence:
-            return grid_y, grid_x, 254
-
-        return grid_y, grid_x, 127
-
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [
-            executor.submit(process_cell, grid_y, grid_x)
-            for grid_y in range(y_size)
-            for grid_x in range(x_size)
+            executor.submit(
+                _process_row_block,
+                int(row_boundaries[i]),
+                int(row_boundaries[i + 1]),
+                x_size,
+                ground_height_map,
+                obstacle_tree,
+                grid_resolution,
+                map_origin,
+                relative_z_min,
+                relative_z_max,
+                sample_count,
+            )
+            for i in range(len(row_boundaries) - 1)
         ]
 
         for future in as_completed(futures):
-            grid_y, grid_x, value = future.result()
-            grid[grid_y, grid_x] = value
+            row_start, block = future.result()
+            grid[row_start:row_start + block.shape[0], :] = block
 
     return grid
 
@@ -338,6 +386,11 @@ def _filter_small_clusters(
 
 
 def run(args) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
     bag_path = Path(args.input_bag)
     output_path = Path(args.output_path)
 
@@ -350,13 +403,11 @@ def run(args) -> None:
     )
 
     if missing_topics:
-        sys.exit(
-            f"Error: Required topics not found: {missing_topics}"
-        )
+        sys.exit(f"Error: Required topics not found: {missing_topics}")
 
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
-    print(f"[1/6] Loading odometry from '{args.odom_topic}'...")
+    logger.info("[1/6] Loading odometry from '%s'...", args.odom_topic)
 
     odom_times: list[float] = []
     odom_poses: list[np.ndarray] = []
@@ -373,33 +424,35 @@ def run(args) -> None:
         ):
             try:
                 message = reader.deserialize(raw, connection.msgtype)
-
                 transform = get_odom_transform_matrix(message)
-
-                if transform is not None:
-                    odom_times.append(timestamp * 1e-9)
-                    odom_poses.append(transform)
-
-            except Exception:
+            except (AttributeError, KeyError, struct.error, ValueError) as exc:
+                # AttributeError/KeyError: malformed or unexpected message
+                # schema. struct.error: corrupted binary payload.
+                # ValueError: bad numeric field (e.g. non-finite quaternion).
+                logger.warning(
+                    "Skipping malformed odometry message at t=%.3f: %s",
+                    timestamp * 1e-9, exc,
+                )
                 continue
+
+            if transform is not None:
+                odom_times.append(timestamp * 1e-9)
+                odom_poses.append(transform)
 
     if not odom_times:
         sys.exit("Error: No valid odometry messages found.")
 
     order = np.argsort(odom_times)
-
     odom_times = [odom_times[index] for index in order]
-
     odom_poses = np.asarray(
         [odom_poses[index] for index in order],
         dtype=np.float64,
     )
 
-    print(f" Loaded {len(odom_times)} odometry poses.")
+    logger.info("Loaded %d odometry poses.", len(odom_times))
 
-    print(
-        f"\n[2/6] Building 3D OcTree "
-        f"(octree_res={args.octree_res} m)..."
+    logger.info(
+        "[2/6] Building 3D OcTree (octree_res=%s m)...", args.octree_res
     )
 
     obstacle_tree = pyoctomap.OcTree(args.octree_res)
@@ -436,8 +489,11 @@ def run(args) -> None:
             try:
                 message = reader.deserialize(raw, connection.msgtype)
                 points = pointcloud2_to_numpy(message)
-
-            except Exception:
+            except (AttributeError, KeyError, struct.error, ValueError) as exc:
+                logger.warning(
+                    "Skipping malformed PointCloud2 message at t=%.3f: %s",
+                    timestamp * 1e-9, exc,
+                )
                 continue
 
             if points is None or len(points) == 0:
@@ -451,26 +507,18 @@ def run(args) -> None:
 
             timestamp_seconds = timestamp * 1e-9
 
-            odom_index = _nearest_index(
-                odom_times,
-                timestamp_seconds,
-            )
+            odom_index = _nearest_index(odom_times, timestamp_seconds)
 
             if odom_index is None:
                 continue
 
             if (
-                abs(
-                    odom_times[odom_index]
-                    - timestamp_seconds
-                )
+                abs(odom_times[odom_index] - timestamp_seconds)
                 > args.odom_max_latency
             ):
                 continue
 
-            sensor_origin = odom_poses[odom_index][:3, 3].astype(
-                np.float64
-            )
+            sensor_origin = odom_poses[odom_index][:3, 3].astype(np.float64)
 
             # IMPORTANT:
             # Keep the coordinate convention from your validated script.
@@ -482,26 +530,19 @@ def run(args) -> None:
                     sensor_origin,
                     -1.0,
                 )
-
-            except Exception as exc:
-                print(
-                    f"\r [{selected_frames}] "
-                    f"OcTree insertion error: {exc}",
-                    end="",
-                    flush=True,
+            except RuntimeError as exc:
+                # pyoctomap raises RuntimeError on malformed/degenerate
+                # ray-casting input (e.g. NaN sensor origin).
+                logger.warning(
+                    "[%d] OcTree insertion error: %s", selected_frames, exc
                 )
                 continue
 
             if args.voxel_size > 0:
                 cloud = o3d.geometry.PointCloud()
                 cloud.points = o3d.utility.Vector3dVector(points)
-
-                downsampled = cloud.voxel_down_sample(
-                    args.voxel_size
-                )
-
+                downsampled = cloud.voxel_down_sample(args.voxel_size)
                 chunk = np.asarray(downsampled.points)
-
             else:
                 chunk = points
 
@@ -509,25 +550,16 @@ def run(args) -> None:
                 point_chunks.append(chunk)
                 valid_frames += 1
 
-            print(
-                f"\r [{selected_frames}] {len(points)} pts",
-                end="",
-                flush=True,
-            )
-
-    print()
-
     if not point_chunks:
         sys.exit("Error: No valid point clouds processed.")
 
-    print(
-        f" Processed {valid_frames} valid frames "
-        f"from {seen_frames} bag frames."
+    logger.info(
+        "Processed %d valid frames from %d bag frames.",
+        valid_frames, seen_frames,
     )
+    logger.info("OcTree: %d nodes.", obstacle_tree.size())
 
-    print(f" OcTree: {obstacle_tree.size()} nodes.")
-
-    print("\n[3/6] Separating ground from obstacles...")
+    logger.info("[3/6] Separating ground from obstacles...")
 
     all_points = np.vstack(point_chunks)
     del point_chunks
@@ -542,32 +574,21 @@ def run(args) -> None:
         args.voxel_size,
     )
 
-    print("\n[4/6] Building ground height map...")
+    logger.info("[4/6] Building ground height map...")
 
     map_origin = all_points.min(axis=0)
     map_max = all_points.max(axis=0)
 
     x_size = max(
         1,
-        int(
-            np.ceil(
-                (map_max[0] - map_origin[0])
-                / args.grid_res
-            )
-        ),
+        int(np.ceil((map_max[0] - map_origin[0]) / args.grid_res)),
     )
-
     y_size = max(
         1,
-        int(
-            np.ceil(
-                (map_max[1] - map_origin[1])
-                / args.grid_res
-            )
-        ),
+        int(np.ceil((map_max[1] - map_origin[1]) / args.grid_res)),
     )
 
-    print(f" Grid: {x_size} x {y_size} cells")
+    logger.info("Grid: %d x %d cells", x_size, y_size)
 
     ground_height_map = _build_ground_height_map(
         ground_points,
@@ -577,7 +598,7 @@ def run(args) -> None:
         y_size,
     )
 
-    print("\n[5/6] Generating occupancy grid...")
+    logger.info("[5/6] Generating occupancy grid...")
 
     occupancy_grid = _create_hybrid_occupancy_grid(
         obstacle_tree,
@@ -590,18 +611,16 @@ def run(args) -> None:
     )
 
     if args.min_cluster_size > 0:
-        print(
-            f"\n[5.5/6] Denoising "
-            f"(min_cluster_size={args.min_cluster_size})..."
+        logger.info(
+            "[5.5/6] Denoising (min_cluster_size=%d)...", args.min_cluster_size
         )
-
         occupancy_grid = _filter_small_clusters(
             occupancy_grid,
             args.min_cluster_size,
             args.closing_iters,
         )
 
-    print("\n[6/6] Saving output files...")
+    logger.info("[6/6] Saving output files...")
 
     pgm_path = output_path.with_suffix(".pgm")
     yaml_path = output_path.with_suffix(".yaml")
@@ -630,13 +649,13 @@ def run(args) -> None:
     with yaml_path.open("w", encoding="utf-8") as output_file:
         yaml.dump(yaml_data, output_file, sort_keys=False)
 
-    print(f" Occupied cells: {np.count_nonzero(occupancy_grid == 0)}")
-    print(f" Free cells: {np.count_nonzero(occupancy_grid == 254)}")
-    print(f" Unknown cells: {np.count_nonzero(occupancy_grid == 127)}")
-    print(f"Saved: {pgm_path}")
-    print(f"Saved preview: {png_path}")
-    print(f"Saved: {yaml_path}")
-    print("Done.")
+    logger.info("Occupied cells: %d", np.count_nonzero(occupancy_grid == 0))
+    logger.info("Free cells: %d", np.count_nonzero(occupancy_grid == 254))
+    logger.info("Unknown cells: %d", np.count_nonzero(occupancy_grid == 127))
+    logger.info("Saved: %s", pgm_path)
+    logger.info("Saved preview: %s", png_path)
+    logger.info("Saved: %s", yaml_path)
+    logger.info("Done.")
 
 
 def build_parser(sub):
@@ -652,12 +671,10 @@ def build_parser(sub):
         "--pc_topic",
         default="/dlio/odom_node/pointcloud/deskewed",
     )
-
     parser.add_argument(
         "--odom_topic",
         default="/dlio/odom_node/odom",
     )
-
     parser.add_argument("--octree_res", type=float, default=0.1)
     parser.add_argument("--grid_res", type=float, default=0.05)
     parser.add_argument("--slope_deg", type=float, default=15.0)
@@ -672,14 +689,12 @@ def build_parser(sub):
         default=1,
         help="Process every Nth PointCloud2 frame.",
     )
-
     parser.add_argument(
         "--max_frames",
         type=int,
         default=0,
         help="Maximum selected PointCloud2 frames; 0 means all.",
     )
-
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min_cluster_size", type=int, default=20)
     parser.add_argument("--closing_iters", type=int, default=1)

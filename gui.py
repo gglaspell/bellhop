@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gui.py – Bellhop graphical launcher.
+gui.py - Bellhop graphical launcher.
 
 The GUI runs on the host. Pre-flight checks and all pipelines run
 inside the configured Bellhop Docker image.
@@ -8,6 +8,7 @@ inside the configured Bellhop Docker image.
 
 from __future__ import annotations
 
+import logging
 import queue
 import subprocess
 import threading
@@ -15,40 +16,17 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font, scrolledtext, ttk
 
+logger = logging.getLogger(__name__)
 
 _COMMON_REGISTRATION = [
     ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
-    (
-        "icp_dist_thresh",
-        "ICP max correspondence (m)",
-        "entry",
-        "0.2",
-        {},
-    ),
-    (
-        "icp_fitness_thresh",
-        "ICP fitness threshold",
-        "entry",
-        "0.6",
-        {},
-    ),
+    ("icp_dist_thresh", "ICP max correspondence (m)", "entry", "0.2", {}),
+    ("icp_fitness_thresh", "ICP fitness threshold", "entry", "0.6", {}),
     ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
     ("enable_loop_closure", "Enable loop closure", "check", False, {}),
     ("loop_closure_radius", "Loop closure radius (m)", "entry", "10.0", {}),
-    (
-        "loop_closure_fitness_thresh",
-        "LC fitness threshold",
-        "entry",
-        "0.3",
-        {},
-    ),
-    (
-        "loop_closure_search_interval",
-        "LC search interval",
-        "entry",
-        "10",
-        {},
-    ),
+    ("loop_closure_fitness_thresh", "LC fitness threshold", "entry", "0.3", {}),
+    ("loop_closure_search_interval", "LC search interval", "entry", "10", {}),
     ("workers", "Worker threads", "spinbox", "1", {"from_": 1, "to": 32}),
     (
         "frame_stride",
@@ -82,20 +60,8 @@ _COMMON_RECONSTRUCTION = [
         {"values": ["Auto", "6", "7", "8", "9", "10", "11"]},
     ),
     ("min_density_percentile", "Min density percentile", "entry", "1.0", {}),
-    (
-        "distance_multiplier",
-        "Distance trim multiplier",
-        "entry",
-        "3.0",
-        {},
-    ),
-    (
-        "max_vertex_distance",
-        "Distance trim hard cap (m)",
-        "entry",
-        "",
-        {},
-    ),
+    ("distance_multiplier", "Distance trim multiplier", "entry", "3.0", {}),
+    ("max_vertex_distance", "Distance trim hard cap (m)", "entry", "", {}),
     ("remesh", "Remesh + smooth", "check", True, {}),
     (
         "remesh_smooth_iterations",
@@ -105,13 +71,7 @@ _COMMON_RECONSTRUCTION = [
         {"from_": 0, "to": 50},
     ),
     ("decimate_target", "Decimate target (ratio/>1)", "entry", "", {}),
-    (
-        "curvature_percentile",
-        "Protect curvature percentile",
-        "entry",
-        "80.0",
-        {},
-    ),
+    ("curvature_percentile", "Protect curvature percentile", "entry", "80.0", {}),
     (
         "curvature_protect_rings",
         "Curvature protection rings",
@@ -127,8 +87,8 @@ _HEIGHT_FALSE_COLOR = [
         "height_colormap",
         "Height false-color",
         "combobox",
-        "Off",
-        {"values": ["Off", "jet", "hot", "cool", "gray"]},
+        "gray",
+        {"values": ["jet", "hot", "cool", "gray"]},
     ),
     (
         "height_texture_size",
@@ -160,7 +120,7 @@ _GPS_TOPIC = [
 PROFILES = {
     "OG Map": {
         "pipeline": "og_map",
-        "description": "2D Nav2 occupancy grid → .pgm + .yaml",
+        "description": "2D Nav2 occupancy grid -> .pgm + .yaml",
         "required_topics_fields": ["pc_topic", "odom_topic"],
         "params": [
             (
@@ -184,13 +144,7 @@ PROFILES = {
             ("z_min", "Obstacle Z minimum (m)", "entry", "0.1", {}),
             ("z_max", "Obstacle Z maximum (m)", "entry", "2.0", {}),
             ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
-            (
-                "odom_max_latency",
-                "Odom max latency (s)",
-                "entry",
-                "0.5",
-                {},
-            ),
+            ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
             (
                 "frame_stride",
                 "Frame stride",
@@ -198,13 +152,7 @@ PROFILES = {
                 "1",
                 {"from_": 1, "to": 100},
             ),
-            (
-                "max_frames",
-                "Maximum frames (0 = all)",
-                "entry",
-                "0",
-                {},
-            ),
+            ("max_frames", "Maximum frames (0 = all)", "entry", "0", {}),
             (
                 "min_cluster_size",
                 "Minimum cluster size",
@@ -244,7 +192,7 @@ PROFILES = {
     },
     "Color Mesh": {
         "pipeline": "color_mesh",
-        "description": "Camera-coloured Poisson mesh → .ply + .obj",
+        "description": "Camera-coloured Poisson mesh -> .ply + .obj",
         "required_topics_fields": [
             "pc_topic",
             "camera_topic",
@@ -257,43 +205,132 @@ PROFILES = {
             + _COMMON_RECONSTRUCTION
         ),
     },
+    "Texture Baking": {
+        "pipeline": "texture_baking",
+        "description": "Keyframe-baked textured mesh (ATAK zip)",
+        "required_topics_fields": [
+            "pc_topic",
+            "camera_topic",
+            "camera_info_topic",
+            "odom_topic",
+        ],
+        "params": (
+            _COMMON_TOPICS
+            + _COMMON_COLOR
+            + [
+                ("min_movement_m", "Keyframe min movement (m)", "entry", "0.5", {}),
+                (
+                    "min_rotation_deg",
+                    "Keyframe min rotation (deg)",
+                    "entry",
+                    "15.0",
+                    {},
+                ),
+                ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
+                ("ror_radius", "ROR radius (m, 0=off)", "entry", "0.0", {}),
+                (
+                    "ror_min_neighbors",
+                    "ROR min neighbors",
+                    "spinbox",
+                    "10",
+                    {"from_": 1, "to": 200},
+                ),
+                (
+                    "sor_neighbors",
+                    "SOR neighbors",
+                    "spinbox",
+                    "20",
+                    {"from_": 1, "to": 200},
+                ),
+                ("sor_std_ratio", "SOR std ratio", "entry", "2.0", {}),
+                (
+                    "poisson_depth",
+                    "Poisson depth",
+                    "spinbox",
+                    "8",
+                    {"from_": 4, "to": 14},
+                ),
+                (
+                    "poisson_max_distance",
+                    "Poisson max distance (m)",
+                    "entry",
+                    "0.5",
+                    {},
+                ),
+                (
+                    "smooth_method",
+                    "Smoothing method",
+                    "combobox",
+                    "taubin",
+                    {"values": ["taubin", "laplacian"]},
+                ),
+                (
+                    "smooth_iterations",
+                    "Smoothing iterations",
+                    "spinbox",
+                    "5",
+                    {"from_": 0, "to": 50},
+                ),
+                ("smooth_lambda", "Smoothing lambda", "entry", "0.5", {}),
+                ("cull_min_angle", "Cull min angle (deg)", "entry", "75.0", {}),
+                (
+                    "target_faces",
+                    "Target face count (blank = off)",
+                    "entry",
+                    "",
+                    {},
+                ),
+                ("assign_min_angle", "Assign min angle (deg)", "entry", "75.0", {}),
+                ("max_bake_distance", "Max bake distance (m)", "entry", "4.0", {}),
+                ("min_bake_distance", "Min bake distance (m)", "entry", "0.4", {}),
+                (
+                    "assignment_smooth_iterations",
+                    "Assignment smoothing iterations",
+                    "spinbox",
+                    "3",
+                    {"from_": 0, "to": 20},
+                ),
+                (
+                    "atlas_size",
+                    "Atlas texture size (px)",
+                    "combobox",
+                    "8192",
+                    {"values": ["2048", "4096", "8192", "16384"]},
+                ),
+            ]
+        ),
+    },
     "Gazebo World": {
         "pipeline": "gazebo_world",
-        "description": "Gazebo simulation world → .stl + .sdf + .world",
+        "description": "Gazebo simulation world -> .stl + .sdf + .world",
         "required_topics_fields": ["pc_topic"],
-        "params": [
-            ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
-            ("odom_topic", "Odometry topic", "entry", "", {}),
-            ("model_name", "Model name", "entry", "bag_environment", {}),
-            (
-                "gazebo_material",
-                "Gazebo material",
-                "combobox",
-                "Gazebo/Grey",
-                {
-                    "values": [
-                        "Gazebo/Grey",
-                        "Gazebo/White",
-                        "Gazebo/Black",
-                        "Gazebo/Wood",
-                        "Gazebo/Bricks",
-                        "Gazebo/Grass",
-                    ]
-                },
-            ),
-        ]
-        + _COMMON_REGISTRATION
-        + _COMMON_RECONSTRUCTION,
+        "params": (
+            [
+                ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
+                ("odom_topic", "Odometry topic", "entry", "", {}),
+                ("model_name", "Model name", "entry", "bag_environment", {}),
+                (
+                    "gazebo_material",
+                    "Gazebo material",
+                    "combobox",
+                    "Gazebo/Grey",
+                    {"values": [...]},
+                ),
+                # level_floor removed here — already provided by _COMMON_RECONSTRUCTION
+            ]
+            + _COMMON_REGISTRATION
+            + _COMMON_RECONSTRUCTION
+        ),
     },
     "3D Tiles": {
         "pipeline": "tiles_3d",
-        "description": "Georeferenced Cesium 3D Tiles → tileset.json",
+        "description": "Georeferenced Cesium 3D Tiles -> tileset.json",
         "required_topics_fields": ["pc_topic", "gps_topic"],
         "params": _COMMON_TOPICS + _GPS_TOPIC + _COMMON_REGISTRATION,
     },
     "Color Tiles": {
         "pipeline": "color_tiles_3d",
-        "description": "Coloured georeferenced Cesium 3D Tiles → tileset.json",
+        "description": "Coloured georeferenced Cesium 3D Tiles -> tileset.json",
         "required_topics_fields": ["pc_topic", "gps_topic"],
         "params": (
             _COMMON_TOPICS
@@ -382,7 +419,7 @@ class BellhopGUI:
 
         self.title_label = tk.Label(
             self.header,
-            text="⬡ bellhop",
+            text="\u2b21 bellhop",
             font=self.font_title,
             padx=16,
         )
@@ -390,7 +427,7 @@ class BellhopGUI:
 
         self.theme_button = tk.Button(
             self.header,
-            text="◑",
+            text="\u25d1",
             font=self.font_body,
             relief="flat",
             padx=12,
@@ -453,7 +490,6 @@ class BellhopGUI:
             orient="vertical",
             command=self.canvas.yview,
         )
-
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.scrollbar.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -608,7 +644,7 @@ class BellhopGUI:
 
         self.run_button = tk.Button(
             self.form_frame,
-            text="▶ Run Pipeline",
+            text="\u25b6 Run Pipeline",
             font=font.Font(
                 family="Helvetica Neue",
                 size=13,
@@ -642,7 +678,6 @@ class BellhopGUI:
             padx=16,
             pady=(12, 2),
         )
-
         tk.Label(
             frame,
             text=text.upper(),
@@ -682,9 +717,7 @@ class BellhopGUI:
                 if kind == "bag"
                 else "Select output directory"
             )
-
             selected = filedialog.askdirectory(title=title)
-
             if selected:
                 variable.set(selected)
 
@@ -805,13 +838,13 @@ class BellhopGUI:
         ).get().strip()
 
         if not bag_path:
-            self._set_preflight("⚠ No bag path set.", "warning")
+            self._set_preflight("\u26a0 No bag path set.", "warning")
             return
 
         bag_dir = Path(bag_path).expanduser().resolve()
 
         if not bag_dir.is_dir():
-            self._set_preflight("✗ Bag directory does not exist.", "error")
+            self._set_preflight("\u2717 Bag directory does not exist.", "error")
             return
 
         profile = PROFILES[self.current_profile]
@@ -822,18 +855,17 @@ class BellhopGUI:
                 field,
                 tk.StringVar(),
             ).get().strip()
-
             if value:
                 required_topics.append(value)
 
         if not required_topics:
             self._set_preflight(
-                "⚠ No required topics configured.",
+                "\u26a0 No required topics configured.",
                 "warning",
             )
             return
 
-        self._set_preflight("Checking in Docker…", "muted")
+        self._set_preflight("Checking in Docker...", "muted")
 
         image = self.docker_image.get().strip() or "bellhop:latest"
         topic_literal = repr(required_topics)
@@ -867,40 +899,31 @@ class BellhopGUI:
                     stderr=subprocess.STDOUT,
                     check=False,
                 )
-
                 output = completed.stdout.strip()
 
                 if completed.returncode != 0:
-                    self.log_queue.put(
-                        (
-                            "preflight_error",
-                            output or "Docker pre-flight command failed.",
-                        )
-                    )
+                    self.log_queue.put((
+                        "preflight_error",
+                        output or "Docker pre-flight command failed.",
+                    ))
                 elif output.startswith("MISSING:"):
-                    self.log_queue.put(
-                        ("preflight_error", output)
-                    )
+                    self.log_queue.put(("preflight_error", output))
                 else:
-                    self.log_queue.put(
-                        ("preflight_ok", output or "OK")
-                    )
+                    self.log_queue.put(("preflight_ok", output or "OK"))
 
             except FileNotFoundError:
-                self.log_queue.put(
-                    (
-                        "preflight_error",
-                        "Docker was not found on PATH.",
-                    )
-                )
-
-            except Exception as exc:
-                self.log_queue.put(
-                    (
-                        "preflight_error",
-                        f"Pre-flight failed: {exc}",
-                    )
-                )
+                self.log_queue.put((
+                    "preflight_error",
+                    "Docker was not found on PATH.",
+                ))
+            except (subprocess.SubprocessError, OSError) as exc:
+                # subprocess.run() can raise OSError (e.g. permission
+                # denied executing docker) or SubprocessError subclasses.
+                # Anything else is an unexpected bug and should propagate.
+                self.log_queue.put((
+                    "preflight_error",
+                    f"Pre-flight failed: {exc}",
+                ))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -916,8 +939,11 @@ class BellhopGUI:
 
         try:
             self.preflight_label.configure(text=message, fg=color)
-        except Exception:
-            pass
+        except tk.TclError as exc:
+            # The label widget may have been destroyed mid-rebuild (e.g.
+            # the user switched profiles while a background preflight
+            # thread was still delivering its result).
+            logger.debug("Could not update preflight label (widget gone?): %s", exc)
 
     def _build_command(self) -> list[str] | None:
         bag_path = self.param_vars.get(
@@ -986,7 +1012,6 @@ class BellhopGUI:
                     command.append(f"--{argument}")
                 elif argument == "remesh":
                     command.append("--no-remesh")
-
                 continue
 
             value = str(value).strip()
@@ -1015,7 +1040,7 @@ class BellhopGUI:
 
         self._log(f"$ {' '.join(command)}\n\n", "muted")
         self.running = True
-        self.run_button.configure(state="disabled", text="⏳ Running…")
+        self.run_button.configure(state="disabled", text="\u23f3 Running...")
 
         def worker() -> None:
             try:
@@ -1034,27 +1059,28 @@ class BellhopGUI:
                 process.wait()
 
                 if process.returncode == 0:
-                    self.log_queue.put(
-                        (
-                            "done_ok",
-                            "Pipeline finished successfully.\n",
-                        )
-                    )
+                    self.log_queue.put((
+                        "done_ok",
+                        "Pipeline finished successfully.\n",
+                    ))
                 else:
-                    self.log_queue.put(
-                        (
-                            "done_error",
-                            f"Pipeline exited with code {process.returncode}.\n",
-                        )
-                    )
-
-            except Exception as exc:
-                self.log_queue.put(
-                    (
+                    self.log_queue.put((
                         "done_error",
-                        f"Failed to start pipeline: {exc}\n",
-                    )
-                )
+                        f"Pipeline exited with code {process.returncode}.\n",
+                    ))
+
+            except FileNotFoundError:
+                self.log_queue.put((
+                    "done_error",
+                    "Docker was not found on PATH.\n",
+                ))
+            except OSError as exc:
+                # Popen can raise OSError for permission issues or other
+                # OS-level failures starting the subprocess.
+                self.log_queue.put((
+                    "done_error",
+                    f"Failed to start pipeline: {exc}\n",
+                ))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1067,11 +1093,11 @@ class BellhopGUI:
                     self._log(text)
 
                 elif kind == "preflight_ok":
-                    self._set_preflight(f"✓ {text}", "ok")
+                    self._set_preflight(f"\u2713 {text}", "ok")
                     self._log(f"Pre-flight OK: {text}\n", "ok")
 
                 elif kind == "preflight_error":
-                    self._set_preflight(f"✗ {text}", "error")
+                    self._set_preflight(f"\u2717 {text}", "error")
                     self._log(f"Pre-flight FAIL: {text}\n", "error")
 
                 elif kind == "done_ok":
@@ -1079,7 +1105,7 @@ class BellhopGUI:
                     self.running = False
                     self.run_button.configure(
                         state="normal",
-                        text="▶ Run Pipeline",
+                        text="\u25b6 Run Pipeline",
                     )
 
                 elif kind == "done_error":
@@ -1087,7 +1113,7 @@ class BellhopGUI:
                     self.running = False
                     self.run_button.configure(
                         state="normal",
-                        text="▶ Run Pipeline",
+                        text="\u25b6 Run Pipeline",
                     )
 
         except queue.Empty:
@@ -1177,9 +1203,15 @@ class BellhopGUI:
                         bg=colors["log_bg"],
                         fg=colors["log_fg"],
                     )
-
-            except Exception:
-                pass
+            except tk.TclError as exc:
+                # A widget on this platform/Tk build may not support one
+                # of the options passed to configure() for its class
+                # (rare). Log it instead of hiding it; a KeyError from a
+                # missing palette entry will still propagate as a bug.
+                logger.debug(
+                    "Theme option unsupported for widget class '%s': %s",
+                    widget_class, exc,
+                )
 
             for child in widget.winfo_children():
                 apply_to_children(child)
@@ -1215,8 +1247,11 @@ class BellhopGUI:
                 activebackground=colors["primary"],
                 activeforeground=colors["primary_fg"],
             )
-        except Exception:
-            pass
+        except tk.TclError as exc:
+            # run_button may not exist yet on the very first call from
+            # __init__ before _build_layout() has finished, or may be
+            # mid-destruction during a profile switch.
+            logger.debug("Could not theme run_button: %s", exc)
 
         self._update_sidebar_highlight()
 
@@ -1226,8 +1261,10 @@ def main() -> None:
 
     try:
         root.tk.call("tk", "scaling", 1.3)
-    except Exception:
-        pass
+    except tk.TclError as exc:
+        # Some minimal Tk builds do not support the "scaling"
+        # subcommand; the GUI still works at default DPI scaling.
+        logger.warning("Could not set Tk DPI scaling to 1.3: %s", exc)
 
     BellhopGUI(root)
     root.mainloop()

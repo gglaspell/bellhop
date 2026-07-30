@@ -180,14 +180,21 @@ def simplify_curvature_aware(mesh: o3d.geometry.TriangleMesh, target_triangles: 
     return _cleanup_mesh(result)
 
 
-def create_mesh(pcd: o3d.geometry.PointCloud, poisson_depth: Optional[int] = None, min_density_percentile: float = 1.0, distance_multiplier: float = 3.0, max_vertex_distance: Optional[float] = None, remesh: bool = True, remesh_smooth_iterations: int = 5, workers: int = 4, decimate_target: Optional[float] = None, curvature_percentile: float = 80.0, curvature_protect_rings: int = 1) -> o3d.geometry.TriangleMesh:
+def create_mesh(pcd, poisson_depth=None, min_density_percentile=1.0,
+                 distance_multiplier=3.0, max_vertex_distance=None,
+                 remesh=True, remesh_smooth_iterations=5, workers=4,
+                 decimate_target=None, curvature_percentile=80.0,
+                 curvature_protect_rings=1):
     """Reconstruct a cleaned mesh; automatic depth is capped at 11, manual depth is not."""
     if not pcd.has_normals():
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-        try:
-            pcd.orient_normals_consistent_tangent_plane(100)
-        except Exception:
-            pass
+    try:
+        pcd.orient_normals_consistent_tangent_plane(100)
+    except RuntimeError as exc:
+        # Same degenerate-graph failure mode as registration.py's
+        # estimate_geometric_normals_oriented(); normals stay unoriented
+        # rather than the mesh build aborting.
+        logging.warning("orient_normals_consistent_tangent_plane failed (%s); normals may be inconsistently oriented.", exc)
     depth = suggest_poisson_depth(pcd) if poisson_depth is None else int(poisson_depth)
     if depth < 2:
         raise ValueError("--poisson_depth must be at least 2.")

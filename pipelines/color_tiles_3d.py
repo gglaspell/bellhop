@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-color_tiles_3d.py – ROS 2 bag -> registered COLORED point cloud
+color_tiles_3d.py - ROS 2 bag -> registered COLORED point cloud
 -> georeferenced -> Cesium 3D Tiles.
 
 This pipeline is the union of color_mesh coloring logic and tiles_3d
@@ -17,30 +17,26 @@ Pipeline:
 7. Clean merged cloud.
 8. ENU -> ECEF conversion.
 9. Write colored ECEF PLY -> py3dtiles convert -> tileset.json.
+
+REFACTOR NOTE: Bag-reading, world-frame merge, and the ENU->ECEF->PLY->
+py3dtiles tail-end logic now live in `shared/tiles_common.py` and are
+shared with `tiles_3d.py`, so bugfixes to that shared logic no longer
+need to be applied twice by hand.
 """
 
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
 from PIL import Image
-from rosbags.highlevel import AnyReader
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
-from tqdm import tqdm
 
 from .shared.preflight import check_topics
-from .shared.reconstruction import clean_point_cloud, transform_local_enu_to_ecef
-from .shared.registration import (
-    _safe_normalize,
-    attach_view_rays_as_normals,
-    run_icp_posegraph,
-)
+from .shared.reconstruction import clean_point_cloud
+from .shared.registration import _safe_normalize, run_icp_posegraph
 from .shared.ros_io import (
-    TYPESTORE,
     convert_ros_image,
     convert_ros_pc2_to_o3d,
     get_closest_timestamp,
@@ -48,7 +44,12 @@ from .shared.ros_io import (
     intrinsics_from_camera_info,
     parse_gps_fixes,
 )
-from .tiles_3d import _run_py3dtiles_convert, _write_colored_ply_ecef, _write_ply_ecef
+from .shared.tiles_common import (
+    georeference_and_export_tileset,
+    read_bag_topics,
+    transform_frame_to_world,
+)
+
 
 # ---------------------------------------------------------------------------
 # Color projection (identical to color_mesh; kept local to avoid import cycle)
@@ -112,6 +113,7 @@ def _merge_colored_pcds(
             if pcd.has_normals()
             else np.zeros((len(pts), 3), dtype=np.float64)
         )
+
         std = np.std(cols, axis=1)
         mean = np.mean(cols, axis=1)
         is_gray = (std < 0.08) & (np.abs(mean - 0.5) < 0.15)
@@ -147,6 +149,7 @@ def _merge_colored_pcds(
 
     return merged.voxel_down_sample(voxel_size)
 
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -167,50 +170,51 @@ def run(args) -> None:
     if missing:
         sys.exit(
             f"Error: Required topics missing from bag: {missing}\n"
-            "Check topic names with: ros2 bag info "
+            "Check topic names with: ros2 bag info <bag>"
         )
 
     if args.camera_topic and not args.camera_info_topic:
         sys.exit("Error: --camera_topic requires --camera_info_topic.")
 
-    # ── GPS origin ────────────────────────────────────────────────────────
+    # -- GPS origin ----------------------------------------------------
     print(f"[1/7] Reading GPS fixes from '{args.gps_topic}'...")
     lat0, lon0, alt0 = parse_gps_fixes(bag_path, args.gps_topic)
 
-    # ── Read bag ──────────────────────────────────────────────────────────
-    topics = [args.pc_topic]
-    if args.odom_topic: topics.append(args.odom_topic)
-    if args.camera_topic: topics += [args.camera_topic, args.camera_info_topic]
-
+    # -- Read bag --------------------------------------------------------
     pointclouds: list[tuple[int, o3d.geometry.PointCloud]] = []
     odom_data: dict[int, np.ndarray] = {}
     camera_images: dict[int, Image.Image] = {}
     cam_info_data: dict[int, tuple] = {}
 
+    def handle_pc(message, timestamp: int) -> None:
+        pcd = convert_ros_pc2_to_o3d(message)
+        if pcd is not None and len(pcd.points) >= 100:
+            pointclouds.append((timestamp, pcd))
+
+    def handle_odom(message, timestamp: int) -> None:
+        transform = get_odom_transform(message)
+        if transform is not None:
+            odom_data[timestamp] = transform
+
+    def handle_camera(message, timestamp: int) -> None:
+        img = convert_ros_image(message)
+        if img is not None:
+            camera_images[timestamp] = img
+
+    def handle_camera_info(message, timestamp: int) -> None:
+        intr = intrinsics_from_camera_info(message)
+        if intr is not None:
+            cam_info_data[timestamp] = intr
+
+    handlers = {args.pc_topic: handle_pc}
+    if args.odom_topic:
+        handlers[args.odom_topic] = handle_odom
+    if args.camera_topic:
+        handlers[args.camera_topic] = handle_camera
+        handlers[args.camera_info_topic] = handle_camera_info
+
     print(f"\n[2/7] Reading messages from: {bag_path}")
-    with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
-        conns = [c for c in reader.connections if c.topic in topics]
-        for conn, ts, raw in tqdm(reader.messages(connections=conns), desc="Reading"):
-            try:
-                msg = reader.deserialize(raw, conn.msgtype)
-                if conn.topic == args.pc_topic:
-                    pcd = convert_ros_pc2_to_o3d(msg)
-                    if pcd is not None and len(pcd.points) >= 100:
-                        pointclouds.append((ts, pcd))
-                elif args.odom_topic and conn.topic == args.odom_topic:
-                    T = get_odom_transform(msg)
-                    if T is not None:
-                        odom_data[ts] = T
-                elif args.camera_topic and conn.topic == args.camera_topic:
-                    img = convert_ros_image(msg)
-                    if img is not None:
-                        camera_images[ts] = img
-                elif args.camera_info_topic and conn.topic == args.camera_info_topic:
-                    intr = intrinsics_from_camera_info(msg)
-                    if intr is not None:
-                        cam_info_data[ts] = intr
-            except Exception:
-                continue
+    read_bag_topics(bag_path, handlers, desc="Reading")
 
     if not pointclouds:
         sys.exit("Error: No valid point clouds extracted.")
@@ -230,14 +234,14 @@ def run(args) -> None:
 
     print(f"  Frames: {len(pointclouds)} | Odom: {len(odom_data)}")
 
-    # ── ICP + pose graph ──────────────────────────────────────────────────
-    print(f"\n[3/7] ICP registration + pose-graph optimisation...")
+    # -- ICP + pose graph --------------------------------------------------
+    print("\n[3/7] ICP registration + pose-graph optimisation...")
     posegraph, good_idx = run_icp_posegraph(pointclouds, odom_data, args)
     odom_max_ns = int(args.odom_max_latency * 1e9)
     odom_ts_sorted = sorted(odom_data.keys())
     cam_ts_sorted = sorted(camera_images.keys())
 
-    # ── Merge + color projection ──────────────────────────────────────────
+    # -- Merge + color projection -------------------------------------------
     print(f"\n[4/7] Merging registered frames{' with color projection' if color_mode else ''}...")
     pcd_combined = o3d.geometry.PointCloud()
     colored_frames: list[o3d.geometry.PointCloud] = []
@@ -247,13 +251,11 @@ def run(args) -> None:
             break
         T_world = np.linalg.inv(posegraph.nodes[node_i].pose)
         ts, pcd_raw = pointclouds[pc_i]
-        pcd_world = pcd_raw.voxel_down_sample(args.voxel_size)
-        pcd_world.transform(T_world)
-
-        if odom_ts_sorted:
-            cts = get_closest_timestamp(ts, odom_ts_sorted)
-            if cts is not None and abs(cts - ts) < odom_max_ns:
-                attach_view_rays_as_normals(pcd_world, odom_data[cts][:3, 3])
+        pcd_world = transform_frame_to_world(
+            pcd_raw, T_world, args.voxel_size,
+            timestamp=ts, odom_data=odom_data,
+            odom_ts_sorted=odom_ts_sorted, odom_max_ns=odom_max_ns,
+        )
 
         if color_mode and cam_ts_sorted:
             cam_ts = get_closest_timestamp(ts, cam_ts_sorted)
@@ -281,7 +283,7 @@ def run(args) -> None:
     elif color_mode:
         print("  Warning: no colored frames produced; check --max_time_diff.")
 
-    # ── Clean ─────────────────────────────────────────────────────────────
+    # -- Clean -------------------------------------------------------------
     print("\n[5/7] Cleaning merged cloud...")
     pcd_clean = clean_point_cloud(
         pcd_combined, args.voxel_size, do_voxel_downsample=False
@@ -291,33 +293,13 @@ def run(args) -> None:
         sys.exit("Error: No points remain after cleaning.")
     print(f"  Final cloud: {len(pcd_clean.points):,} points")
 
-    # ── ENU -> ECEF ───────────────────────────────────────────────────────
+    # -- Georeference + export ---------------------------------------------
     print("\n[6/7] Georeferencing (local ENU -> ECEF)...")
-    pts_enu = np.asarray(pcd_clean.points, dtype=np.float64)
-    pts_ecef = transform_local_enu_to_ecef(pts_enu, lat0, lon0, alt0)
-
-    # ── Write ECEF PLY + py3dtiles ────────────────────────────────────────
     print("\n[7/7] Writing 3D Tiles...")
-    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
-        ply_path = Path(tmp.name)
+    tiles_dir, _ = georeference_and_export_tileset(
+        pcd_clean, lat0, lon0, alt0, out_dir, bag_path.stem, args.workers
+    )
 
-    has_colors = pcd_clean.has_colors()
-    if has_colors:
-        colors = np.asarray(pcd_clean.colors, dtype=np.float64)
-        _write_colored_ply_ecef(pts_ecef, colors, ply_path)
-    else:
-        _write_ply_ecef(pts_ecef, ply_path)
-
-    tiles_dir = out_dir / "tileset"
-    tiles_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        _run_py3dtiles_convert(ply_path, tiles_dir, jobs=args.workers)
-    finally:
-        ply_path.unlink(missing_ok=True)
-
-    enu_ply = out_dir / f"{bag_path.stem}_cloud_enu.ply"
-    o3d.io.write_point_cloud(str(enu_ply), pcd_clean)
-    print(f"  ENU cloud: {enu_ply}")
     print(f"\nColored 3D Tiles written to: {tiles_dir}")
     print("Done.")
 
@@ -335,18 +317,18 @@ def build_parser(sub):
     p.add_argument("--odom_topic", default=None)
     p.add_argument("--gps_topic", default="/gps/fix")
     p.add_argument("--camera_topic", default=None,
-                   help="sensor_msgs/Image or CompressedImage topic. Optional.")
+                    help="sensor_msgs/Image or CompressedImage topic. Optional.")
     p.add_argument("--camera_info_topic", default=None,
-                   help="sensor_msgs/CameraInfo topic. Required with --camera_topic.")
+                    help="sensor_msgs/CameraInfo topic. Required with --camera_topic.")
 
     # Color
     p.add_argument("--max_time_diff", type=float, default=0.1,
-                   help="Max timestamp diff (s) between PC frame and camera image.")
+                    help="Max timestamp diff (s) between PC frame and camera image.")
     p.add_argument("--color_min_depth", type=float, default=0.1)
     p.add_argument("--color_max_depth", type=float, default=None)
     p.add_argument("--gray_filter_radius", type=float, default=0.05,
-                   help="Gray-fill points with a real-color neighbor within this "
-                        "radius (m) are removed. 0 = disable.")
+                    help="Gray-fill points with a real-color neighbor within this "
+                         "radius (m) are removed. 0 = disable.")
 
     # Registration
     p.add_argument("--voxel_size", type=float, default=0.05)
@@ -358,11 +340,11 @@ def build_parser(sub):
     p.add_argument("--loop_closure_fitness_thresh", type=float, default=0.3)
     p.add_argument("--loop_closure_search_interval", type=int, default=10)
     p.add_argument("--frame_stride", type=int, default=0,
-                   help="Process every Nth frame (0 = all frames).")
+                    help="Process every Nth frame (0 = all frames).")
     p.add_argument("--max_registration_frames", type=int, default=0,
-                   help="Cap total frames used for registration (0 = all).")
+                    help="Cap total frames used for registration (0 = all).")
     p.add_argument("--merge_chunk_frames", type=int, default=16,
-                   help="Number of frames per merge chunk.")
+                    help="Number of frames per merge chunk.")
 
     # Performance
     p.add_argument("--workers", type=int, default=4)

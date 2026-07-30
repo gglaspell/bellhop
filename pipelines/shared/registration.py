@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-registration.py – Shared ICP + pose-graph + loop-closure helpers.
+registration.py - Shared ICP + pose-graph + loop-closure helpers.
 
 Used by: mesh, color_mesh, gazebo_world, tiles_3d, color_tiles_3d.
 NOT used by: og_map (uses OcTree ray-casting instead).
@@ -22,6 +22,7 @@ Registration controls
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Iterator
 from typing import Any
 
@@ -30,6 +31,8 @@ import open3d as o3d
 from tqdm import tqdm
 
 from .ros_io import get_closest_timestamp
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +76,7 @@ def select_registration_frames(
 
         original_indices:
             Index of each selected record within the original `pointclouds`
-            list.  The caller needs these after registration because pipeline
+            list. The caller needs these after registration because pipeline
             merge stages index the original, full input list.
 
     Semantics:
@@ -108,7 +111,7 @@ def iter_registered_frame_chunks(
 
     Pipeline merge code can use this to keep a batch-local temporary cloud,
     append it to the final output, then discard it before processing the next
-    batch.  A non-positive value means one chunk containing all frames.
+    batch. A non-positive value means one chunk containing all frames.
     """
     if not successful_original_indices:
         return
@@ -145,6 +148,11 @@ def attach_view_rays_as_normals(
 
     These are intentionally temporary: downstream code retains them before
     geometric normal estimation, then uses them to orient final normals.
+
+    IMPORTANT: Point clouds carrying these view rays must NEVER be passed
+    directly into point-to-plane ICP or FPFH feature computation. Use
+    `_ensure_unit_geometric_normals()` (or `estimate_geometric_normals_oriented`)
+    to replace them with true unit-length geometric normals first.
     """
     points = np.asarray(pcd_world.points, dtype=np.float64)
     if len(points) == 0:
@@ -200,8 +208,44 @@ def estimate_geometric_normals_oriented(
 
     try:
         pcd.orient_normals_consistent_tangent_plane(100)
-    except Exception:
-        pass
+    except RuntimeError as exc:
+        # Open3D raises RuntimeError (often wrapping a C++ exception) when
+        # the tangent-plane graph is degenerate -- e.g. too few neighbors,
+        # a fully planar/collinear point set, or a disconnected KNN graph.
+        # Normals already computed by estimate_normals() above are kept;
+        # only their *global* orientation consistency is lost.
+        logger.warning(
+            "orient_normals_consistent_tangent_plane failed for a cloud "
+            "with %d points (voxel_size=%.4g): %s. Falling back to "
+            "per-point normals without global orientation consistency.",
+            len(pcd.points), voxel_size, exc,
+        )
+
+
+def _ensure_unit_geometric_normals(
+    pcd: o3d.geometry.PointCloud,
+    voxel_size: float,
+) -> None:
+    """
+    Force `pcd` to carry true unit-length geometric normals before it is
+    used for point-to-plane ICP or FPFH feature computation.
+
+    This helper always (re)computes normals via `estimate_normals()`
+    regardless of whether normals are already present, guaranteeing that
+    every normal consumed by ICP/FPFH in this module is a genuine unit-
+    length geometric normal (not a leftover, unnormalised view ray from
+    `attach_view_rays_as_normals()`).
+    """
+    if len(pcd.points) == 0:
+        return
+
+    radius = max(float(voxel_size) * 2.0, 1e-4)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius,
+            max_nn=30,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +261,11 @@ def compute_fpfh_descriptor(
 
     voxel_size = max(float(voxel_size), 1e-4)
 
-    if not pcd.has_normals():
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=voxel_size * 2.0,
-                max_nn=30,
-            )
-        )
+    # Always (re)compute geometric normals rather than trusting
+    # has_normals(). A cloud carrying leftover view-ray "normals" from
+    # attach_view_rays_as_normals() would otherwise be fed straight into
+    # compute_fpfh_feature(), which requires unit-length surface normals.
+    _ensure_unit_geometric_normals(pcd, voxel_size)
 
     return o3d.pipelines.registration.compute_fpfh_feature(
         pcd,
@@ -307,9 +349,12 @@ def detect_loop_closure(
             continue
 
         try:
+            source_copy = copy.deepcopy(current_pcd)
+            target_copy = copy.deepcopy(historical_pcds[historical_idx])
+
             coarse = ransac_coarse_alignment(
-                copy.deepcopy(current_pcd),
-                copy.deepcopy(historical_pcds[historical_idx]),
+                source_copy,
+                target_copy,
                 current_fpfh,
                 historical_fpfh,
                 voxel_size,
@@ -318,9 +363,17 @@ def detect_loop_closure(
             if coarse.fitness < float(loop_fitness_thresh) * 0.5:
                 continue
 
+            # Point-to-plane ICP requires unit-length geometric normals on
+            # both source and target. Force correct normals on the
+            # deep-copied clouds used for refinement, since whatever
+            # normals were attached earlier (view rays or geometric) are
+            # not guaranteed to match what this stage needs.
+            _ensure_unit_geometric_normals(source_copy, voxel_size)
+            _ensure_unit_geometric_normals(target_copy, voxel_size)
+
             refined = o3d.pipelines.registration.registration_icp(
-                copy.deepcopy(current_pcd),
-                copy.deepcopy(historical_pcds[historical_idx]),
+                source_copy,
+                target_copy,
                 max(float(voxel_size) * 1.5, 1e-4),
                 coarse.transformation,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane(),
@@ -330,14 +383,21 @@ def detect_loop_closure(
             )
 
             if refined.fitness >= float(loop_fitness_thresh):
-                candidates.append(
-                    (
-                        historical_idx,
-                        refined.transformation,
-                        float(refined.fitness),
-                    )
-                )
-        except Exception:
+                candidates.append((
+                    historical_idx,
+                    refined.transformation,
+                    float(refined.fitness),
+                ))
+
+        except (RuntimeError, ValueError) as exc:
+            # RuntimeError: Open3D RANSAC/ICP failure on degenerate or
+            # mismatched feature/point data.
+            # ValueError: malformed inputs (e.g. empty point cloud) that
+            # slipped through upstream checks.
+            logger.debug(
+                "Loop-closure candidate against historical node %d rejected: %s",
+                historical_idx, exc,
+            )
             continue
 
     return candidates
@@ -417,12 +477,10 @@ def run_icp_posegraph(
     if len(source.points) == 0:
         raise RuntimeError("The first selected registration frame is empty.")
 
-    source.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=max(voxel_size * 2.0, 1e-4),
-            max_nn=30,
-        )
-    )
+    # Use the shared helper so behaviour matches compute_fpfh_descriptor
+    # and detect_loop_closure -- always a fresh geometric-normal estimate,
+    # never a stale/leftover view-ray normal.
+    _ensure_unit_geometric_normals(source, voxel_size)
 
     previous_odom_transform: np.ndarray | None = None
     if odom_ts_sorted:
@@ -457,12 +515,8 @@ def run_icp_posegraph(
         if len(target.points) == 0:
             continue
 
-        target.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=max(voxel_size * 2.0, 1e-4),
-                max_nn=30,
-            )
-        )
+        # Same normal-safety guarantee as `source` above.
+        _ensure_unit_geometric_normals(target, voxel_size)
 
         initial_guess = np.eye(4, dtype=np.float64)
         current_odom_transform: np.ndarray | None = None
@@ -491,7 +545,13 @@ def run_icp_posegraph(
                     max_iteration=50
                 ),
             )
-        except Exception:
+        except RuntimeError as exc:
+            # Open3D ICP raises RuntimeError on degenerate correspondence
+            # sets (e.g. no points within icp_dist_thresh of each other).
+            logger.debug(
+                "ICP failed for frame at selected index %d (timestamp=%d): %s",
+                selected_idx, timestamp, exc,
+            )
             continue
 
         if registration.fitness < icp_fitness_thresh:
@@ -576,7 +636,7 @@ def run_icp_posegraph(
 
     if len(posegraph.nodes) < 2:
         raise RuntimeError(
-            "Registration failed — fewer than two frames met the ICP fitness "
+            "Registration failed - fewer than two frames met the ICP fitness "
             "threshold. Try lowering --icp_fitness_thresh, increasing "
             "--icp_dist_thresh, or reducing --frame_stride."
         )
@@ -588,6 +648,7 @@ def run_icp_posegraph(
         f"Optimising pose graph ({len(posegraph.nodes):,} nodes, "
         f"{len(posegraph.edges):,} edges)..."
     )
+
     option = o3d.pipelines.registration.GlobalOptimizationOption(
         max_correspondence_distance=icp_dist_thresh,
         edge_prune_threshold=0.25,
@@ -602,10 +663,15 @@ def run_icp_posegraph(
             option,
         )
         print("Pose graph optimisation complete.")
-    except Exception as exc:
-        print(
-            f"Warning: pose graph optimisation failed ({exc}); "
-            "using unoptimised poses."
+    except RuntimeError as exc:
+        # Open3D's global optimizer can raise RuntimeError on a
+        # numerically ill-conditioned pose graph (e.g. disconnected
+        # components, degenerate loop-closure edges). Falling back to
+        # the unoptimised, purely sequential poses keeps the pipeline
+        # usable instead of aborting the whole run.
+        logger.warning(
+            "Pose graph optimisation failed (%s); using unoptimised poses.",
+            exc,
         )
 
     successful_original_indices = [

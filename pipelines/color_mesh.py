@@ -149,7 +149,18 @@ def _read_registration_data(
     bag_path: Path,
     args,
 ) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], dict[int, np.ndarray]]:
-    """First pass: retain only bounded, voxelized registration scans."""
+    """First pass: retain bounded, voxelized registration scans.
+
+    NOTE: frame_stride is intentionally NOT applied here. Striding is
+    applied exactly once, downstream, inside
+    registration.select_registration_frames(), which is called from
+    run_icp_posegraph(). Applying it here as well silently compounds
+    with that later selection (e.g. stride=4 here + stride=4 there ==
+    an effective stride of 16), causing far fewer frames to survive
+    than --max_registration_frames would suggest. This function only
+    enforces --min_frame_points and a generous read-ahead cap derived
+    from --max_registration_frames so very large bags are still bounded.
+    """
     topics = [args.pc_topic] + (
         [args.odom_topic] if args.odom_topic else []
     )
@@ -157,9 +168,11 @@ def _read_registration_data(
     frames: list[tuple[int, o3d.geometry.PointCloud]] = []
     odom_data: dict[int, np.ndarray] = {}
 
-    seen_clouds = 0
-    frame_stride = max(1, int(args.frame_stride))
-    frame_limit = int(args.max_registration_frames)
+    stride = max(1, int(args.frame_stride))
+    max_registration_frames = max(0, int(args.max_registration_frames))
+    read_ahead_limit = (
+        max_registration_frames * stride if max_registration_frames else 0
+    )
 
     print(f"Reading registration frames: {bag_path}")
 
@@ -188,14 +201,6 @@ def _read_registration_data(
                 if connection.topic != args.pc_topic:
                     continue
 
-                seen_clouds += 1
-
-                if (seen_clouds - 1) % frame_stride:
-                    continue
-
-                if frame_limit and len(frames) >= frame_limit:
-                    continue
-
                 cloud = convert_ros_pc2_to_o3d(message)
 
                 if cloud is None or len(cloud.points) < args.min_frame_points:
@@ -203,8 +208,16 @@ def _read_registration_data(
 
                 cloud = cloud.voxel_down_sample(args.voxel_size)
 
-                if len(cloud.points) >= args.min_frame_points:
-                    frames.append((timestamp, cloud))
+                if len(cloud.points) < args.min_frame_points:
+                    continue
+
+                frames.append((timestamp, cloud))
+
+                if read_ahead_limit and len(frames) >= read_ahead_limit:
+                    print(
+                        f"Registration read-ahead limit reached: {read_ahead_limit}."
+                    )
+                    break
 
             except Exception:
                 continue
@@ -519,7 +532,6 @@ def build_parser(sub):
         "color_mesh",
         help="ROS 2 bag -> memory-bounded camera-coloured Poisson mesh",
     )
-
     parser.add_argument("bagpath", help="Path to the ROS 2 bag.")
     parser.add_argument("outputdir", help="Output directory.")
 
