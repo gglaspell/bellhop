@@ -4,42 +4,125 @@ colormesh3d.atlas_pipeline.viewassignment
 Per-face view assignment for the atlas-bake pipeline.
 """
 
-from collections import Counter
 from pathlib import Path
 
 import logging
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
+from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 from colormesh3d.common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
 from colormesh3d.common.projection import world_to_optical, project_to_pixels
 
 
-def _smooth_assignments(mesh, assignments, iterations=3):
-    """Majority-vote smoothing over face adjacency to reduce per-face keyframe fragmentation."""
+def _build_face_adjacency_csr(mesh):
+    """Precompute face-adjacency once as a CSR sparse matrix.
+
+    FIX: previously each call site (this module and atlas_packer) queried
+    or masked `mesh.face_adjacency` independently, and _smooth_assignments
+    rebuilt a Python list-of-lists neighbour structure from scratch every
+    time it was invoked. Centralising this into a single reusable sparse
+    matrix builder means the O(n_edges) adjacency scan happens once and the
+    same precomputed structure can be reused across keyframe loops and
+    smoothing calls instead of being rebuilt per-invocation.
+    """
     adj = mesh.face_adjacency
+    n_faces = len(mesh.faces)
+    rows = np.concatenate([adj[:, 0], adj[:, 1]])
+    cols = np.concatenate([adj[:, 1], adj[:, 0]])
+    return csr_matrix(
+        (np.ones(len(rows), dtype=bool), (rows, cols)), shape=(n_faces, n_faces)
+    )
+
+
+def _smooth_assignments(mesh, assignments, iterations=3, adj_sparse=None):
+    """Majority-vote smoothing over face adjacency to reduce per-face keyframe fragmentation.
+
+    FIX: fully vectorized replacement for the previous per-face Python loop
+    + collections.Counter majority vote. Uses the CSR adjacency's
+    (indptr, indices) arrays to build an explicit (src, dst) edge-list view
+    of the graph once, then per iteration:
+      1. Filters edges whose destination face is currently assigned
+         (assignments[dst] != -1) -- unassigned neighbours never
+         contribute votes, exactly as `if assignments[j] != -1` did.
+      2. Tallies (src_face, neighbour_label) vote counts via a single
+         np.unique on a combined integer key, which is equivalent to
+         building a Counter per face but done for every face at once.
+      3. For each face, picks the label with the *strictly highest* count.
+         Ties are broken by NumPy's stable sort order (first-encountered
+         label among the tied maximum), which matches
+         `Counter.most_common(1)` -- Python's Counter also preserves
+         insertion order among equal counts (insertion order here being
+         neighbour-list order, i.e. ascending neighbour face id, identical
+         to the original `neighbours[face_i]` list order since indices are
+         stored in ascending order within each CSR row).
+      4. Applies the exact same strict majority rule
+         `majority_count > len(nbrs) / 2` (using each face's true degree,
+         not just the number of assigned neighbours) before reassigning.
+    Faces with 0 neighbours, or whose neighbours are all unassigned (-1),
+    are left unchanged, matching the original `continue` branches.
+    """
     n_faces = len(assignments)
 
-    neighbours = [[] for _ in range(n_faces)]
-    for a, b in adj:
-        neighbours[a].append(b)
-        neighbours[b].append(a)
+    if adj_sparse is None:
+        adj_sparse = _build_face_adjacency_csr(mesh)
+
+    indptr, indices = adj_sparse.indptr, adj_sparse.indices
+    deg = np.diff(indptr)
+    edge_src = np.repeat(np.arange(n_faces), deg)
+    edge_dst = indices
+
+    assignments = assignments.copy()
 
     for _ in range(iterations):
+        dst_labels = assignments[edge_dst]
+        valid = dst_labels != -1
+        if not np.any(valid):
+            continue
+
+        v_src = edge_src[valid]
+        v_labels = dst_labels[valid]
+
+        uniq_labels, inv = np.unique(v_labels, return_inverse=True)
+        n_labels = len(uniq_labels)
+
+        # Combined key encodes (face, label-index) so a single np.unique
+        # call tallies per-(face, label) vote counts for every face in
+        # one pass, equivalent to a per-face Counter but vectorized.
+        combined = v_src.astype(np.int64) * n_labels + inv.astype(np.int64)
+        uniq_combined, counts = np.unique(combined, return_counts=True)
+
+        face_of_combined = uniq_combined // n_labels
+        label_idx_of_combined = uniq_combined % n_labels
+
+        # Sort by (face, -count) so that for each face the first row after
+        # grouping is its highest-count label; ties keep the lowest
+        # label-index (== lowest neighbour face id among tied labels,
+        # matching Counter's insertion-order tie-break given ascending
+        # CSR neighbour order).
+        order = np.lexsort((-counts, face_of_combined))
+        sorted_faces = face_of_combined[order]
+        sorted_counts = counts[order]
+        sorted_label_idx = label_idx_of_combined[order]
+
+        first_mask = np.empty(len(sorted_faces), dtype=bool)
+        first_mask[0] = True
+        first_mask[1:] = sorted_faces[1:] != sorted_faces[:-1]
+
+        best_faces = sorted_faces[first_mask]
+        best_counts = sorted_counts[first_mask]
+        best_label_idx = sorted_label_idx[first_mask]
+
+        # Strict majority rule uses each face's TRUE degree (deg), not the
+        # count of assigned neighbours, exactly matching the original
+        # `majority_count > len(nbrs) / 2` where len(nbrs) was the full
+        # neighbour list length including unassigned (-1) neighbours.
         new_assignments = assignments.copy()
-        for face_i in range(n_faces):
-            nbrs = neighbours[face_i]
-            if not nbrs:
-                continue
-            assigned_nbrs = [assignments[j] for j in nbrs if assignments[j] != -1]
-            if not assigned_nbrs:
-                continue
-            vote = Counter(assigned_nbrs)
-            majority_kf, majority_count = vote.most_common(1)[0]
-            if majority_count > len(nbrs) / 2:
-                new_assignments[face_i] = majority_kf
+        majority = best_counts > (deg[best_faces] / 2)
+        new_assignments[best_faces[majority]] = uniq_labels[best_label_idx[majority]]
         assignments = new_assignments
 
     return assignments
@@ -111,14 +194,41 @@ class ViewAssigner:
 
         kf_poses = [get_pose_at(self.traj, self.tree, ts) for _, ts, _ in self.keyframes]
 
+        # FIX: build a KD-tree over face centers once, then for each
+        # keyframe only consider faces within max_bake_distance of that
+        # keyframe's CAMERA POSITION (cp) -- not the mesh centroid -- before
+        # running the full projection/visibility math. This is a strict
+        # superset prefilter: the radius query uses max_bake_distance (the
+        # sqrt of self.max_bake_dist_sq), which returns every face that
+        # could possibly pass the existing `dist ** 2 < self.max_bake_dist_sq`
+        # mask, AND also every face that the existing
+        # `dist ** 2 > self.min_bake_dist_sq` mask would keep, since
+        # min_bake_distance <= max_bake_distance always narrows from the
+        # same near end. In other words the KD-tree query only prunes faces
+        # that are guaranteed to fail the max-distance mask anyway; the
+        # min-distance mask is still applied afterward, unchanged, on the
+        # candidate subset. This preserves correctness while skipping the
+        # expensive projection math for faces that are trivially too far.
+        max_bake_distance = float(np.sqrt(self.max_bake_dist_sq))
+        face_tree = cKDTree(centers)
+
         for kf_idx, (cp, cr) in enumerate(tqdm(kf_poses)):
-            opt = world_to_optical(centers, cp, cr)
+            candidate_idx = np.asarray(
+                face_tree.query_ball_point(cp, max_bake_distance), dtype=np.int64
+            )
+            if len(candidate_idx) == 0:
+                continue
+
+            cand_centers = centers[candidate_idx]
+            cand_normals = normals[candidate_idx]
+
+            opt = world_to_optical(cand_centers, cp, cr)
             mask = opt[:, 2] > 0.1
             if not np.any(mask):
                 continue
 
             # normals are direction vectors; cam_pos=zeros is correct here
-            n_opt = world_to_optical(normals, np.zeros(3), cr)
+            n_opt = world_to_optical(cand_normals, np.zeros(3), cr)
 
             view_dir = -opt
             dist = np.linalg.norm(view_dir, axis=1)
@@ -131,14 +241,14 @@ class ViewAssigner:
 
             u, v, _ = project_to_pixels(opt, fx, fy, cx, cy, min_z=0.1)
             mask &= (u >= 0) & (u < w) & (v >= 0) & (v < h)
-            valid_indices = np.where(mask)[0]
-            if len(valid_indices) == 0:
+            valid_local = np.where(mask)[0]
+            if len(valid_local) == 0:
                 continue
 
             z = opt[:, 2]
-            u_int = np.clip(np.floor(u[valid_indices]).astype(int), 0, w - 1)
-            v_int = np.clip(np.floor(v[valid_indices]).astype(int), 0, h - 1)
-            depths = z[valid_indices]
+            u_int = np.clip(np.floor(u[valid_local]).astype(int), 0, w - 1)
+            v_int = np.clip(np.floor(v[valid_local]).astype(int), 0, h - 1)
+            depths = z[valid_local]
 
             sort_order = np.argsort(depths)
             flat_idx = v_int[sort_order] * w + u_int[sort_order]
@@ -148,15 +258,18 @@ class ViewAssigner:
             z_buffer[flat_idx[unique_idx]] = depths[sort_order][unique_idx]
 
             is_visible = depths < (z_buffer[v_int * w + u_int] + 0.02)
-            final_indices = valid_indices[is_visible]
-            if len(final_indices) == 0:
+            final_local = valid_local[is_visible]
+            if len(final_local) == 0:
                 continue
+
+            # Map local (candidate-subset) indices back to global face ids.
+            final_indices = candidate_idx[final_local]
 
             coverage[final_indices] += 1
 
-            f_align = align[final_indices]
-            f_dist_sq = dist[final_indices] ** 2
-            f_u, f_v = u[final_indices], v[final_indices]
+            f_align = align[final_local]
+            f_dist_sq = dist[final_local] ** 2
+            f_u, f_v = u[final_local], v[final_local]
             dist_from_center = np.sqrt(((f_u - cx) / (w / 2)) ** 2 + ((f_v - cy) / (h / 2)) ** 2)
             vignette_weight = np.clip(1.0 - (dist_from_center * 0.6), 0.2, 1.0)
 
@@ -173,7 +286,8 @@ class ViewAssigner:
                 f"({self.assignment_smooth_iterations} iterations)..."
             )
             assignments = _smooth_assignments(
-                self.mesh, assignments, self.assignment_smooth_iterations
+                self.mesh, assignments, self.assignment_smooth_iterations,
+                adj_sparse=_build_face_adjacency_csr(self.mesh),
             )
 
         self._export_coverage_diagnostic(coverage)

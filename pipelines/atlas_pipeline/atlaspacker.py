@@ -6,9 +6,10 @@ UV atlas packing for the atlas-bake pipeline.
 
 import pickle
 
-import networkx as nx
 import numpy as np
 import trimesh
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 from tqdm import tqdm
 import logging
 
@@ -39,6 +40,19 @@ class AtlasPacker:
         verts, faces, adj = self.mesh.vertices, self.mesh.faces, self.mesh.face_adjacency
         fx, fy, cx, cy = self.intr['fx'], self.intr['fy'], self.intr['cx'], self.intr['cy']
         img_w, img_h = self.intr['width'], self.intr['height']
+        n_faces = len(faces)
+
+        # FIX: precompute face-adjacency once as a sparse (n_faces x n_faces)
+        # boolean matrix instead of rescanning the full `adj` edge array with
+        # np.isin(...) on every keyframe iteration. Slicing the sparse matrix
+        # by f_idx is O(nnz in that slice) rather than O(len(adj)) per
+        # keyframe, and produces identical connected components.
+        adj_rows = np.concatenate([adj[:, 0], adj[:, 1]])
+        adj_cols = np.concatenate([adj[:, 1], adj[:, 0]])
+        adj_sparse = csr_matrix(
+            (np.ones(len(adj_rows), dtype=bool), (adj_rows, adj_cols)),
+            shape=(n_faces, n_faces),
+        )
 
         components_data = []
         logging.info("Segmenting charts by connected components...")
@@ -48,10 +62,22 @@ class AtlasPacker:
             if len(f_idx) == 0:
                 continue
 
-            mask = np.isin(adj[:, 0], f_idx) & np.isin(adj[:, 1], f_idx)
-            g = nx.Graph()
-            g.add_nodes_from(f_idx)
-            g.add_edges_from(adj[mask])
+            # FIX: replaced networkx Graph + connected_components with
+            # scipy.sparse.csgraph.connected_components on the precomputed
+            # adjacency slice. `sub` is indexed 0..len(f_idx)-1 (local
+            # indices into f_idx), NOT global face ids -- scipy's
+            # connected_components returns per-node labels in that same
+            # local index space. We map labels back to global face ids via
+            # f_idx immediately below so grouping semantics (which global
+            # faces end up in the same component) are identical to the
+            # previous networkx-based version: two global faces are in the
+            # same chart iff they are connected via edges restricted to
+            # f_idx, exactly as nx.Graph()+add_edges_from(adj[mask]) did.
+            sub = adj_sparse[f_idx][:, f_idx]
+            n_local = len(f_idx)
+            n_components, labels = connected_components(
+                sub, directed=False, connection="weak"
+            )
 
             cp, cr = self._get_kf_pose(kf_idx)
 
@@ -63,8 +89,16 @@ class AtlasPacker:
             vert_to_uv_row = {gv: li for li, gv in enumerate(all_verts_for_kf)}
             uv_all = np.column_stack([u_all, v_all])
 
-            for comp in nx.connected_components(g):
-                comp_idx = np.array(list(comp))
+            # Group local indices by component label, then map back to
+            # global face ids via f_idx -- this reproduces the exact same
+            # per-component global-face-id sets that
+            # nx.connected_components(g) would have yielded, including
+            # isolated (degree-0) faces, each of which forms its own
+            # single-node component under both the old and new approach.
+            for label in range(n_components):
+                comp_idx = f_idx[labels == label]
+                if len(comp_idx) == 0:
+                    continue
                 uniq_v = np.unique(faces[comp_idx])
 
                 local_rows = np.array([vert_to_uv_row[gv] for gv in uniq_v])

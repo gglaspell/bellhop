@@ -245,12 +245,16 @@ class TextureBaker:
 
         logging.info("Generating mipmaps...")
         hh, ww = texture_np.shape[:2]
-        Image.fromarray(
-            cv2.resize(texture_np, (ww // 2, hh // 2), interpolation=cv2.INTER_AREA)
-        ).save(out_tex.with_name(f"{out_tex.stem}_mip1.png"))
-        Image.fromarray(
-            cv2.resize(texture_np, (ww // 4, hh // 4), interpolation=cv2.INTER_AREA)
-        ).save(out_tex.with_name(f"{out_tex.stem}_mip2.png"))
+        # FIX: chain mip generation so mip2 is derived from mip1 rather than
+        # resizing independently from the full-resolution texture_np twice.
+        # This matches standard mip-chain generation and avoids doing two
+        # independent large-kernel INTER_AREA reductions from full res.
+        mip1 = cv2.resize(texture_np, (ww // 2, hh // 2), interpolation=cv2.INTER_AREA)
+        Image.fromarray(mip1).save(out_tex.with_name(f"{out_tex.stem}_mip1.png"))
+
+        mip1_h, mip1_w = mip1.shape[:2]
+        mip2 = cv2.resize(mip1, (ww // 4, hh // 4), interpolation=cv2.INTER_AREA)
+        Image.fromarray(mip2).save(out_tex.with_name(f"{out_tex.stem}_mip2.png"))
 
         # FIX: AtlasPacker writes the intermediate UV mesh as "uv_mesh.obj"
         # (see atlas_pipeline/atlaspacker.py's `pack_and_generate_uvs` output
