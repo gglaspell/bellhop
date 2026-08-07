@@ -4,6 +4,54 @@ gui.py - Bellhop graphical launcher.
 
 The GUI runs on the host. Pre-flight checks and all pipelines run
 inside the configured Bellhop Docker image.
+
+PATCH NOTE (odom-anchored registration + frame-awareness wiring):
+See odom-anchored-registration-fix-prompt.md and
+pointcloud-frame-check-prompt-2.md. `mesh`, `color_mesh`, `gazebo_world`,
+`tiles_3d`, and `color_tiles_3d` were migrated to odom-anchored
+registration with optional/gated ICP refinement and REP-105 frame
+detection. `og_map` and `texture_baking` were separately given REP-105
+frame detection (with odom-anchored local-frame point transformation, but
+no ICP/loop-closure -- neither ever had a registration step to begin
+with). This file wires the relevant new flags through to all seven
+profiles so the CLI commands the GUI builds actually use them end to end.
+
+PATCH NOTE (mesh/color_mesh PLY-only outputs):
+`mesh` and `color_mesh` no longer produce `.obj` mesh files -- both now
+write only a point-cloud `.ply` and a mesh `.ply`. `mesh`'s optional
+height false-color export was also converted from a UV-textured
+OBJ+MTL+PNG bundle to per-vertex colors baked directly into a PLY, so
+`--height_texture_size` no longer does anything and has been removed
+from the Mesh profile's parameter form.
+
+PATCH NOTE (OG Map OcTree insertion perf flags):
+`og_map.py` step [2/6] (OcTree build) gained three new CLI flags --
+`--octree_max_range`, `--octree_lazy_eval`, and `--octree_discretize` --
+to address OcTree-insertion becoming the dominant runtime cost on dense
+LiDAR bags (see the PERF NOTE in og_map.py's module docstring). Those
+flags existed in the CLI but were missing from this GUI's OG Map
+profile, meaning the GUI could never pass them through to `docker run`.
+They are now added directly after the existing `octree_res`/`grid_res`
+fields, matching og_map.py's own defaults (`octree_max_range=-1.0`,
+`octree_lazy_eval=True`, `octree_discretize=False`).
+
+BUGFIX (Texture Baking profile sent unrecognized arguments):
+The Texture Baking profile previously reused `_COMMON_COLOR` (built for
+the camera-*projection*-coloring pipelines `color_mesh`/`color_tiles_3d`:
+`max_time_diff`, `color_min_depth`, `color_max_depth`,
+`gray_filter_radius`) and included explicit `remesh`/
+`remesh_smooth_iterations` fields. `texture_baking.py`'s actual
+`build_parser()` never registers ANY of those six flags -- it has no
+per-point camera-projection step at all (it bakes a UV atlas from
+keyframe view assignment instead), and no isotropic-remesh CLI flag
+either. Sending them produced:
+    unrecognized arguments: --max_time_diff ... --remesh ...
+and the pipeline exited with code 2 before doing any work. Fixed by
+replacing the profile's param list with one that matches
+`texture_baking.py`'s argparse exactly: `camera_topic`/`camera_info_topic`
+(required, but with no projection-specific fields), plus the two flags
+that pipeline DOES accept but the GUI was missing entirely --
+`--min_frame_points` and `--overwrite`.
 """
 
 from __future__ import annotations
@@ -18,15 +66,28 @@ from tkinter import filedialog, font, scrolledtext, ttk
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shared param groups
+# ---------------------------------------------------------------------------
 _COMMON_REGISTRATION = [
     ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
-    ("icp_dist_thresh", "ICP max correspondence (m)", "entry", "0.2", {}),
-    ("icp_fitness_thresh", "ICP fitness threshold", "entry", "0.6", {}),
     ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
+    ("enable_icp_refinement", "Enable ICP refinement (optional, gated)", "check", False, {}),
+    ("icp_dist_thresh", "ICP max correspondence (m)", "entry", "0.2", {}),
+    ("icp_fitness_thresh", "ICP fitness threshold", "entry", "0.7", {}),
+    ("max_icp_translation_correction", "Max ICP translation correction (m)", "entry", "0.3", {}),
+    ("max_icp_rotation_correction_deg", "Max ICP rotation correction (deg)", "entry", "15.0", {}),
     ("enable_loop_closure", "Enable loop closure", "check", False, {}),
     ("loop_closure_radius", "Loop closure radius (m)", "entry", "3.0", {}),
-    ("loop_closure_fitness_thresh", "LC fitness threshold", "entry", "0.6", {}),
+    ("loop_closure_fitness_thresh", "LC fitness threshold", "entry", "0.7", {}),
     ("loop_closure_search_interval", "LC search interval", "entry", "10", {}),
+    (
+        "loop_closure_temporal_window",
+        "LC temporal window (frames)",
+        "spinbox",
+        "100",
+        {"from_": 1, "to": 10000},
+    ),
     ("workers", "Worker threads", "spinbox", "1", {"from_": 1, "to": 32}),
     (
         "frame_stride",
@@ -48,6 +109,21 @@ _COMMON_REGISTRATION = [
         "spinbox",
         "16",
         {"from_": 1, "to": 500},
+    ),
+]
+
+# Used by every pipeline that has REP-105 frame detection wired up:
+# mesh, color_mesh, gazebo_world, tiles_3d, color_tiles_3d (odom-anchored
+# registration + frame detection); og_map and texture_baking (frame
+# detection + odom-anchored local-frame point transform, no ICP/loop
+# closure in either).
+_PC_FRAME_MODE = [
+    (
+        "pc_frame_mode",
+        "Point cloud frame mode",
+        "combobox",
+        "auto",
+        {"values": ["auto", "global", "local"]},
     ),
 ]
 
@@ -82,28 +158,31 @@ _COMMON_RECONSTRUCTION = [
     ("level_floor", "Level floor", "check", False, {}),
 ]
 
+# PATCH: height false-color export is now baked as per-vertex PLY colors
+# (see mesh_utils.apply_height_colormap), not a UV-textured OBJ/MTL/PNG
+# bundle, so the "height_texture_size" LUT-resolution field has been
+# removed -- there is no texture/LUT to size anymore.
 _HEIGHT_FALSE_COLOR = [
     (
         "height_colormap",
-        "Height false-color",
+        "Height false-color (per-vertex PLY)",
         "combobox",
         "gray",
         {"values": ["jet", "hot", "cool", "gray"]},
     ),
-    (
-        "height_texture_size",
-        "Height texture size (px)",
-        "combobox",
-        "1024",
-        {"values": ["256", "512", "1024", "2048", "4096"]},
-    ),
 ]
 
 _COMMON_TOPICS = [
-    ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
+    ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
     ("odom_topic", "Odometry topic", "entry", "", {}),
 ]
 
+# Used only by the camera-PROJECTION-coloring pipelines (color_mesh,
+# color_tiles_3d), which color individual points by projecting a camera
+# image onto them per-frame. texture_baking does NOT use this group -- it
+# has no per-point projection step (it bakes a UV atlas from keyframe view
+# assignment instead), so none of these four fields apply there. See the
+# BUGFIX note above.
 _COMMON_COLOR = [
     ("camera_topic", "Camera topic", "entry", "", {}),
     ("camera_info_topic", "CameraInfo topic", "entry", "", {}),
@@ -117,74 +196,100 @@ _GPS_TOPIC = [
     ("gps_topic", "GPS/NavSatFix topic", "entry", "/gps/fix", {}),
 ]
 
+# PATCH: OcTree insertion perf flags for OG Map (see PATCH NOTE above).
+# Defaults match og_map.py's argparse defaults exactly.
+_OCTREE_PERF = [
+    (
+        "octree_max_range",
+        "OcTree max ray range (m, -1 = unlimited)",
+        "entry",
+        "40",
+        {},
+    ),
+    ("octree_lazy_eval", "OcTree lazy-eval inner-node update", "check", True, {}),
+    ("octree_discretize", "OcTree discretize scan before insertion", "check", True, {}),
+]
+
+# ---------------------------------------------------------------------------
+# Pipeline profiles
+# ---------------------------------------------------------------------------
 PROFILES = {
     "OG Map": {
         "pipeline": "og_map",
         "description": "2D Nav2 occupancy grid -> .pgm + .yaml",
         "required_topics_fields": ["pc_topic", "odom_topic"],
-        "params": [
-            (
-                "pc_topic",
-                "PointCloud2 topic",
-                "entry",
-                "/dlio/odom_node/pointcloud/deskewed",
-                {},
-            ),
-            (
-                "odom_topic",
-                "Odometry topic",
-                "entry",
-                "/dlio/odom_node/odom",
-                {},
-            ),
-            ("octree_res", "OcTree resolution (m)", "entry", "0.1", {}),
-            ("grid_res", "Grid resolution (m)", "entry", "0.10", {}),
-            ("slope_deg", "Ground slope (deg)", "entry", "15.0", {}),
-            ("normal_radius", "Normal radius (m)", "entry", "0.2", {}),
-            ("z_min", "Obstacle Z minimum (m)", "entry", "0.1", {}),
-            ("z_max", "Obstacle Z maximum (m)", "entry", "2.0", {}),
-            ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
-            ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
-            (
-                "frame_stride",
-                "Frame stride",
-                "spinbox",
-                "2",
-                {"from_": 1, "to": 100},
-            ),
-            ("max_frames", "Maximum frames (0 = all)", "entry", "0", {}),
-            (
-                "min_cluster_size",
-                "Minimum cluster size",
-                "spinbox",
-                "20",
-                {"from_": 0, "to": 500},
-            ),
-            (
-                "closing_iters",
-                "Closing iterations",
-                "spinbox",
-                "1",
-                {"from_": 0, "to": 10},
-            ),
-            (
-                "workers",
-                "Worker threads",
-                "spinbox",
-                "4",
-                {"from_": 1, "to": 32},
-            ),
-        ],
+        "params": (
+            [
+                (
+                    "pc_topic",
+                    "PointCloud2 topic",
+                    "entry",
+                    "/points",
+                    {},
+                ),
+                (
+                    "odom_topic",
+                    "Odometry topic",
+                    "entry",
+                    "/odom",
+                    {},
+                ),
+            ]
+            + _PC_FRAME_MODE
+            + [
+                ("octree_res", "OcTree resolution (m)", "entry", "0.10", {}),
+                ("grid_res", "Grid resolution (m)", "entry", "0.10", {}),
+            ]
+            + _OCTREE_PERF
+            + [
+                ("slope_deg", "Ground slope (deg)", "entry", "15.0", {}),
+                ("normal_radius", "Normal radius (m)", "entry", "0.2", {}),
+                ("z_min", "Obstacle Z minimum (m)", "entry", "0.1", {}),
+                ("z_max", "Obstacle Z maximum (m)", "entry", "2.0", {}),
+                ("voxel_size", "Voxel size (m)", "entry", "0.10", {}),
+                ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
+                (
+                    "frame_stride",
+                    "Frame stride",
+                    "spinbox",
+                    "2",
+                    {"from_": 2, "to": 100},
+                ),
+                ("max_frames", "Maximum frames (0 = all)", "entry", "0", {}),
+                (
+                    "min_cluster_size",
+                    "Minimum cluster size",
+                    "spinbox",
+                    "20",
+                    {"from_": 0, "to": 500},
+                ),
+                (
+                    "closing_iters",
+                    "Closing iterations",
+                    "spinbox",
+                    "1",
+                    {"from_": 0, "to": 10},
+                ),
+                (
+                    "workers",
+                    "Worker threads",
+                    "spinbox",
+                    "4",
+                    {"from_": 1, "to": 32},
+                ),
+            ]
+        ),
     },
     "Mesh": {
         "pipeline": "mesh",
         "description": (
-            "Poisson surface mesh -> .ply + .obj; "
-            "optional height-coloured OBJ + MTL + PNG"
+            "Poisson surface mesh -> point-cloud .ply + mesh .ply; "
+            "optional per-vertex height-colored PLY"
         ),
         "required_topics_fields": ["pc_topic"],
         "params": (
             _COMMON_TOPICS
+            + _PC_FRAME_MODE
             + _COMMON_REGISTRATION
             + _COMMON_RECONSTRUCTION
             + _HEIGHT_FALSE_COLOR
@@ -192,7 +297,7 @@ PROFILES = {
     },
     "Color Mesh": {
         "pipeline": "color_mesh",
-        "description": "Camera-coloured Poisson mesh -> .ply + .obj",
+        "description": "Camera-coloured Poisson mesh -> point-cloud .ply + mesh .ply",
         "required_topics_fields": [
             "pc_topic",
             "camera_topic",
@@ -200,6 +305,7 @@ PROFILES = {
         ],
         "params": (
             _COMMON_TOPICS
+            + _PC_FRAME_MODE
             + _COMMON_COLOR
             + _COMMON_REGISTRATION
             + _COMMON_RECONSTRUCTION
@@ -214,17 +320,29 @@ PROFILES = {
             "camera_info_topic",
             "odom_topic",
         ],
+        # BUGFIX: this param list now matches texture_baking.py's actual
+        # argparse exactly -- no _COMMON_COLOR (that group's four fields
+        # are for camera-PROJECTION coloring, which this pipeline doesn't
+        # do), no remesh/remesh_smooth_iterations (no such CLI flag
+        # exists here), and it now includes --min_frame_points and
+        # --overwrite, which the pipeline accepts but the GUI previously
+        # never exposed at all.
         "params": (
-            _COMMON_TOPICS
-            + _COMMON_COLOR
+            [
+                ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
+                ("camera_topic", "Camera topic", "entry", "", {}),
+                ("camera_info_topic", "CameraInfo topic", "entry", "", {}),
+                ("odom_topic", "Odometry topic", "entry", "", {}),
+            ]
+            + _PC_FRAME_MODE
             + [
-                ("min_movement_m", "Keyframe min movement (m)", "entry", "0.5", {}),
+                ("odom_max_latency", "Odom max latency (s, local frame only)", "entry", "0.5", {}),
                 (
-                    "min_rotation_deg",
-                    "Keyframe min rotation (deg)",
-                    "entry",
-                    "15.0",
-                    {},
+                    "min_frame_points",
+                    "Min frame points",
+                    "spinbox",
+                    "100",
+                    {"from_": 0, "to": 100000},
                 ),
                 ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
                 ("ror_radius", "ROR radius (m, 0=off)", "entry", "0.0", {}),
@@ -243,6 +361,14 @@ PROFILES = {
                     {"from_": 1, "to": 200},
                 ),
                 ("sor_std_ratio", "SOR std ratio", "entry", "2.0", {}),
+                ("min_movement_m", "Keyframe min movement (m)", "entry", "0.5", {}),
+                (
+                    "min_rotation_deg",
+                    "Keyframe min rotation (deg)",
+                    "entry",
+                    "15.0",
+                    {},
+                ),
                 (
                     "poisson_depth",
                     "Poisson depth",
@@ -297,6 +423,7 @@ PROFILES = {
                     "8192",
                     {"values": ["2048", "4096", "8192", "16384"]},
                 ),
+                ("overwrite", "Overwrite existing output workspace", "check", True, {}),
             ]
         ),
     },
@@ -306,17 +433,28 @@ PROFILES = {
         "required_topics_fields": ["pc_topic"],
         "params": (
             [
-                ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
+                ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
                 ("odom_topic", "Odometry topic", "entry", "", {}),
+            ]
+            + _PC_FRAME_MODE
+            + [
                 ("model_name", "Model name", "entry", "bag_environment", {}),
                 (
                     "gazebo_material",
                     "Gazebo material",
                     "combobox",
                     "Gazebo/Grey",
-                    {"values": [...]},
+                    {
+                        "values": [
+                            "Gazebo/Grey",
+                            "Gazebo/White",
+                            "Gazebo/Wood",
+                            "Gazebo/Black",
+                            "Gazebo/Green",
+                        ]
+                    },
                 ),
-                # level_floor removed here — already provided by _COMMON_RECONSTRUCTION
+                # level_floor removed here -- already provided by _COMMON_RECONSTRUCTION
             ]
             + _COMMON_REGISTRATION
             + _COMMON_RECONSTRUCTION
@@ -326,7 +464,9 @@ PROFILES = {
         "pipeline": "tiles_3d",
         "description": "Georeferenced Cesium 3D Tiles -> tileset.json",
         "required_topics_fields": ["pc_topic", "gps_topic"],
-        "params": _COMMON_TOPICS + _GPS_TOPIC + _COMMON_REGISTRATION,
+        "params": (
+            _COMMON_TOPICS + _PC_FRAME_MODE + _GPS_TOPIC + _COMMON_REGISTRATION
+        ),
     },
     "Color Tiles": {
         "pipeline": "color_tiles_3d",
@@ -334,6 +474,7 @@ PROFILES = {
         "required_topics_fields": ["pc_topic", "gps_topic"],
         "params": (
             _COMMON_TOPICS
+            + _PC_FRAME_MODE
             + _GPS_TOPIC
             + _COMMON_COLOR
             + _COMMON_REGISTRATION
@@ -678,6 +819,7 @@ class BellhopGUI:
             padx=16,
             pady=(12, 2),
         )
+
         tk.Label(
             frame,
             text=text.upper(),
@@ -1012,6 +1154,12 @@ class BellhopGUI:
                     command.append(f"--{argument}")
                 elif argument == "remesh":
                     command.append("--no-remesh")
+                elif argument == "octree_lazy_eval":
+                    # PATCH: og_map.py's --octree_lazy_eval defaults to True
+                    # via action="store_true", default=True, with a paired
+                    # --no-octree_lazy_eval flag to turn it off. Mirror that
+                    # here: an unchecked box must explicitly disable it.
+                    command.append("--no-octree_lazy_eval")
                 continue
 
             value = str(value).strip()
@@ -1203,6 +1351,7 @@ class BellhopGUI:
                         bg=colors["log_bg"],
                         fg=colors["log_fg"],
                     )
+
             except tk.TclError as exc:
                 # A widget on this platform/Tk build may not support one
                 # of the options passed to configure() for its class

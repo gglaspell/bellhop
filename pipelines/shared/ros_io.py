@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""ros_io.py - Shared ROS 2 message deserialization helpers."""
+"""ros_io.py - Shared ROS 2 message deserialization helpers.
+
+PATCH NOTE (odom-anchored registration + frame-awareness, see
+odom-anchored-registration-fix-prompt.md and
+pointcloud-frame-check-prompt-2.md):
+
+- Added `interpolate_odom_pose()`, which looks up a frame's pose by
+  interpolating between the two bracketing odometry samples closest in
+  time (linear interpolation on translation, SLERP on rotation), instead
+  of nearest-neighbor snapping. This is the primary pose-lookup helper for
+  odom-anchored registration in registration.py.
+- Added `detect_pointcloud_frame_id()`, `classify_frame_mode()`, and
+  `resolve_pc_frame_mode()` to support REP-105 frame-awareness: detecting
+  whether a PointCloud2 topic is already published in a global/fixed frame
+  (`odom`, `map`, `world`) vs. a local/moving sensor frame, with a CLI
+  override for when a bag's frame_id is missing, wrong, or empty.
+
+All existing functions/signatures are unchanged; these are additive.
+"""
 import bisect
 import logging
 import math
@@ -13,12 +31,16 @@ from PIL import Image, UnidentifiedImageError
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 
 logger = logging.getLogger(__name__)
 
 TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 _POINTFIELD_TO_DTYPE = {7: np.float32, 8: np.float64}
 _GPS_NO_FIX = -1
+
+# REP-105 fixed/global frame names (case-insensitive, leading "/" tolerated).
+_GLOBAL_FRAME_IDS = {"odom", "map", "world"}
 
 try:
     from tf_transformations import quaternion_matrix as _qm
@@ -75,7 +97,6 @@ def convert_ros_pc2_to_o3d(msg):
         pts = np.empty((n, 3), np.float64)
         pts[:, 0] = arr["x"]; pts[:, 1] = arr["y"]; pts[:, 2] = arr["z"]
     except (ValueError, TypeError) as exc:
-        # e.g. buffer size mismatch between msg.data and computed dtype/count
         logger.warning("Failed to parse PointCloud2 buffer into structured array: %s", exc)
         return None
 
@@ -182,6 +203,143 @@ def get_closest_timestamp(ts, sorted_keys):
         return sorted_keys[-1]
     b, a = sorted_keys[i - 1], sorted_keys[i]
     return b if (ts - b) <= (a - ts) else a
+
+
+def interpolate_odom_pose(timestamp, odom_ts_sorted, odom_poses, max_latency_ns):
+    """Look up a frame's pose by interpolating bracketing odometry samples.
+
+    Uses linear interpolation on translation and SLERP on rotation between
+    the two odometry samples that bracket `timestamp` in time -- NOT simple
+    nearest-neighbor snapping. This is the PRIMARY pose-lookup path for
+    odom-anchored registration (see odom-anchored-registration-fix-prompt.md).
+
+    Args:
+        timestamp: query time in the same integer-nanosecond units as
+            `odom_ts_sorted`/`odom_poses` keys.
+        odom_ts_sorted: sorted list of odometry sample timestamps.
+        odom_poses: dict mapping timestamp -> 4x4 transform (as produced by
+            `get_odom_transform`).
+        max_latency_ns: maximum allowed gap, in nanoseconds, between
+            `timestamp` and the nearest available odometry coverage before
+            the frame is considered uncovered.
+
+    Returns:
+        A 4x4 np.ndarray pose, or None if `timestamp` falls outside
+        `max_latency_ns` of any odometry coverage (including when
+        `odom_ts_sorted` is empty).
+    """
+    if not odom_ts_sorted:
+        return None
+
+    i = bisect.bisect_left(odom_ts_sorted, timestamp)
+
+    if i == 0:
+        nearest = odom_ts_sorted[0]
+        if abs(timestamp - nearest) > max_latency_ns:
+            return None
+        return odom_poses[nearest].copy()
+
+    if i == len(odom_ts_sorted):
+        nearest = odom_ts_sorted[-1]
+        if abs(timestamp - nearest) > max_latency_ns:
+            return None
+        return odom_poses[nearest].copy()
+
+    t_before = odom_ts_sorted[i - 1]
+    t_after = odom_ts_sorted[i]
+
+    if timestamp == t_before:
+        return odom_poses[t_before].copy()
+    if timestamp == t_after:
+        return odom_poses[t_after].copy()
+
+    if (timestamp - t_before) > max_latency_ns and (t_after - timestamp) > max_latency_ns:
+        return None
+
+    if t_after == t_before:
+        return odom_poses[t_before].copy()
+
+    fraction = (timestamp - t_before) / float(t_after - t_before)
+    fraction = min(1.0, max(0.0, fraction))
+
+    pose_before = odom_poses[t_before]
+    pose_after = odom_poses[t_after]
+
+    translation = pose_before[:3, 3] * (1.0 - fraction) + pose_after[:3, 3] * fraction
+
+    rotations = R.from_matrix(np.stack([pose_before[:3, :3], pose_after[:3, :3]]))
+    slerp = Slerp([0.0, 1.0], rotations)
+    rotation_interp = slerp([fraction])[0]
+
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = rotation_interp.as_matrix()
+    pose[:3, 3] = translation
+    return pose
+
+
+def detect_pointcloud_frame_id(bag_path, pc_topic):
+    """Peek the first message on `pc_topic` and return its `header.frame_id`.
+
+    Returns "" if the topic is absent, empty, or the first message has no
+    usable header/frame_id.
+    """
+    bag_path = Path(bag_path)
+    try:
+        with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
+            connections = [c for c in reader.connections if c.topic == pc_topic]
+            if not connections:
+                return ""
+            for connection, _timestamp, raw in reader.messages(connections=connections):
+                try:
+                    message = reader.deserialize(raw, connection.msgtype)
+                    frame_id = getattr(getattr(message, "header", None), "frame_id", "") or ""
+                    return frame_id
+                except Exception as exc:  # noqa: BLE001 - best-effort peek, never fatal
+                    logger.warning("Could not deserialize first '%s' message: %s", pc_topic, exc)
+                    return ""
+    except (OSError, RuntimeError) as exc:
+        logger.warning("Could not open bag to detect point-cloud frame_id: %s", exc)
+        return ""
+    return ""
+
+
+def classify_frame_mode(frame_id):
+    """Classify a frame_id as 'global' (fixed) or 'local' (moving) per REP-105.
+
+    'global' covers `odom`, `map`, `world` (case-insensitive, tolerant of a
+    leading '/'). Everything else -- `base_link`, a lidar/camera frame name,
+    or an empty/missing frame_id -- is treated as 'local'.
+
+    CAVEAT: this check only detects whether the point cloud is *already*
+    published in a fixed/global frame. It does NOT correct for a real
+    sensor-to-base_link extrinsic offset (lever arm). Odometry
+    (nav_msgs/Odometry or equivalent) only carries the transform from a
+    fixed frame to the robot's base frame, never the static sensor
+    extrinsics -- fixing a lever-arm offset requires a separate static
+    transform (e.g. from tf_static) applied before/alongside this logic,
+    which is out of scope here.
+    """
+    normalized = (frame_id or "").strip().lstrip("/").lower()
+    return "global" if normalized in _GLOBAL_FRAME_IDS else "local"
+
+
+def resolve_pc_frame_mode(bag_path, pc_topic, pc_frame_mode="auto"):
+    """Resolve the effective point-cloud frame mode ('global' or 'local').
+
+    `pc_frame_mode` is the CLI override (`auto`, `global`, or `local`).
+    `auto` triggers detection via `detect_pointcloud_frame_id()` +
+    `classify_frame_mode()`; `global`/`local` force the result, which is
+    useful when a bag's frame_id is missing, wrong, or empty. Always prints
+    what was detected/forced so users can sanity-check the result.
+    """
+    if pc_frame_mode in ("global", "local"):
+        print(f"Point cloud frame mode forced: '{pc_frame_mode}' (--pc_frame_mode override).")
+        return pc_frame_mode
+
+    frame_id = detect_pointcloud_frame_id(bag_path, pc_topic)
+    mode = classify_frame_mode(frame_id)
+    print(f"Point cloud frame_id: '{frame_id}' -> {mode}")
+    return mode
 
 
 def convert_ros_image(msg):

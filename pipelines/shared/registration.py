@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-registration.py - Shared ICP + pose-graph + loop-closure helpers.
+registration.py - Shared odom-anchored registration + loop-closure helpers.
 
 Used by: mesh, color_mesh, gazebo_world, tiles_3d, color_tiles_3d.
 NOT used by: og_map (uses OcTree ray-casting instead).
@@ -8,41 +8,61 @@ NOT used by: og_map (uses OcTree ray-casting instead).
 Registration controls
 ---------------------
 --frame_stride:
-Register every Nth input PointCloud2 frame. Values <= 1 mean all frames.
+    Register every Nth input PointCloud2 frame. Values <= 1 mean all frames.
 
 --max_registration_frames:
-Limit the number of frames after stride selection. 0 means no limit.
+    Limit the number of frames after stride selection. 0 means no limit.
 
---merge_chunk_frames:
-Used by iter_registered_frame_chunks() to process successful registered
-frame indices in bounded batches during pipeline-side merging. This avoids
-keeping a large temporary merge batch alive at once.
+PATCH NOTE (odom-anchored registration; loop-closure information weighting)
+-----------------------------------------------------------------------------
+All five pipelines that use this module now call
+`run_odom_anchored_registration()` (see odom-anchored-registration-fix-prompt.md
+for the full design), which makes timestamped odometry the PRIMARY pose
+source and demotes ICP to an optional, strongly-gated local refinement.
+This fixed two failure modes present in the previous ICP-primary design:
 
-PATCH NOTE (loop-closure information weighting)
-------------------------------------------------
-Previously, loop-closure edges were assigned an information matrix scaled
-by `fitness * 100.0`, making them roughly 100x more "trusted" than a
-sequential ICP edge with an equivalent fitness score. Because loop closures
-are accepted at a much lower fitness bar than sequential ICP edges (0.3
-default vs 0.6 default), this let mediocre or occasionally incorrect loop
-matches dominate the global pose-graph optimization and warp the whole
-trajectory. The fix below removes the artificial 100x multiplier so loop
-edges are weighted on the same scale as sequential edges, proportional only
-to their own measured fitness.
+1. Silent coverage collapse: frames that failed the ICP fitness bar against
+   the last *successful* frame used to be dropped with no accounting, and
+   the ICP chain could never recover once broken. Odom-anchored pose lookup
+   means registration/ICP quality is never the reason a frame is excluded --
+   only missing odometry coverage is, and that is now logged loudly with an
+   explicit count.
+2. Loop-closure overcorrection: loop edges used to be accepted at a looser
+   fitness bar than sequential edges and weighted 100x higher, letting
+   perceptual aliasing warp the whole trajectory. Loop closure now defaults
+   to the SAME fitness bar as local refinement and is weighted on the same
+   scale as sequential edges (which are themselves weighted far higher than
+   any loop edge), so a bad loop match can only nudge the graph.
+
+CLEANUP NOTE (unused functions removed)
+----------------------------------------
+Now that every caller has migrated to `run_odom_anchored_registration()`,
+the following are no longer referenced anywhere in this codebase and have
+been removed:
+  - `run_icp_posegraph()` -- the old ICP-primary pose-graph pipeline.
+  - `detect_loop_closure()` -- only ever called from `run_icp_posegraph()`;
+    `run_odom_anchored_registration()` performs loop-closure detection
+    inline so each candidate is captured and reused exactly once (see its
+    docstring).
+  - `iter_registered_frame_chunks()` -- documented as a merge-batching
+    helper but never actually called by any pipeline; each pipeline's
+    streaming merge loop manages its own bounded chunk instead.
+If you are restoring ICP-as-primary behaviour for a one-off comparison,
+pull these from version control history rather than re-adding them here.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
-from collections.abc import Iterator
+from collections import deque
 from typing import Any
 
 import numpy as np
 import open3d as o3d
 from tqdm import tqdm
 
-from .ros_io import get_closest_timestamp
+from .ros_io import interpolate_odom_pose
 
 logger = logging.getLogger(__name__)
 
@@ -80,16 +100,16 @@ def select_registration_frames(
     max_registration_frames: int = 0,
 ) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], list[int]]:
     """
-    Select input clouds for pose-graph registration.
+    Select input clouds for registration.
 
     Returns:
         selected_pointclouds:
-            Point-cloud records used internally by ICP.
+            Point-cloud records used internally by registration.
 
         original_indices:
             Index of each selected record within the original `pointclouds`
-            list. The caller needs these after registration because pipeline
-            merge stages index the original, full input list.
+            list. Most callers now look poses up by timestamp instead, but
+            this is kept for callers that still index the original list.
 
     Semantics:
         frame_stride <= 1 (including 0) selects every input frame.
@@ -112,28 +132,6 @@ def select_registration_frames(
         )
 
     return [pointclouds[i] for i in original_indices], original_indices
-
-
-def iter_registered_frame_chunks(
-    successful_original_indices: list[int],
-    merge_chunk_frames: int = 16,
-) -> Iterator[list[int]]:
-    """
-    Yield successful original frame indices in bounded merge batches.
-
-    Pipeline merge code can use this to keep a batch-local temporary cloud,
-    append it to the final output, then discard it before processing the next
-    batch. A non-positive value means one chunk containing all frames.
-    """
-    if not successful_original_indices:
-        return
-
-    chunk_size = int(merge_chunk_frames)
-    if chunk_size <= 0:
-        chunk_size = len(successful_original_indices)
-
-    for start in range(0, len(successful_original_indices), chunk_size):
-        yield successful_original_indices[start : start + chunk_size]
 
 
 # ---------------------------------------------------------------------------
@@ -324,380 +322,349 @@ def ransac_coarse_alignment(
 
 
 # ---------------------------------------------------------------------------
-# Loop closure detection
+# Odom-anchored registration (odom-primary)
 # ---------------------------------------------------------------------------
-def detect_loop_closure(
-    current_idx: int,
-    current_pcd: o3d.geometry.PointCloud,
-    current_fpfh: o3d.pipelines.registration.Feature,
-    historical_pcds: list[o3d.geometry.PointCloud],
-    historical_fpfhs: list[o3d.pipelines.registration.Feature | None],
-    historical_poses: list[np.ndarray],
-    voxel_size: float,
-    search_radius: float = 10.0,
-    loop_fitness_thresh: float = 0.3,
-    temporal_window: int = 100,
-) -> list[tuple[int, np.ndarray, float]]:
+def refine_pose_with_icp(
+    source: o3d.geometry.PointCloud,
+    target: o3d.geometry.PointCloud,
+    odom_relative_transform: np.ndarray,
+    icp_dist_thresh: float,
+    icp_fitness_thresh: float,
+    max_translation_correction: float,
+    max_rotation_correction_deg: float,
+) -> tuple[np.ndarray, bool]:
     """
-    Detect valid historical loop closures for the current successful node.
+    Attempt point-to-plane ICP refinement of an odom-derived relative pose.
 
-    Candidate cloud history contains successful registrations only, so every
-    returned index is a valid pose-graph node index.
+    `source`/`target` must already carry true unit-length geometric normals
+    (see `_ensure_unit_geometric_normals`). `odom_relative_transform` is used
+    as BOTH the initial guess and the fallback result.
+
+    Accepted only if BOTH hold: ICP fitness clears `icp_fitness_thresh`, and
+    the correction's translation/rotation magnitude relative to the odom
+    guess is within the configured bounds. On any rejection or exception,
+    the original odom transform is returned unchanged -- ICP can only nudge
+    an already-valid pose here, never remove a frame from the merge.
+
+    Returns:
+        (relative_transform, accepted)
     """
-    if current_idx <= 0 or current_fpfh is None:
-        return []
+    try:
+        registration = o3d.pipelines.registration.registration_icp(
+            source,
+            target,
+            icp_dist_thresh,
+            odom_relative_transform,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
+        )
+    except RuntimeError as exc:
+        logger.debug("ICP refinement raised an exception; keeping odom pose: %s", exc)
+        return odom_relative_transform, False
 
-    current_pos = historical_poses[current_idx][:3, 3]
-    candidates: list[tuple[int, np.ndarray, float]] = []
+    if registration.fitness < icp_fitness_thresh:
+        return odom_relative_transform, False
 
-    stop = max(0, current_idx - max(1, int(temporal_window)))
-    for historical_idx in range(stop):
-        historical_fpfh = historical_fpfhs[historical_idx]
-        if historical_fpfh is None:
-            continue
+    correction = np.linalg.inv(odom_relative_transform) @ registration.transformation
+    translation_delta = float(np.linalg.norm(correction[:3, 3]))
+    trace = np.clip((np.trace(correction[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+    rotation_delta_deg = float(np.degrees(np.arccos(trace)))
 
-        historical_pos = historical_poses[historical_idx][:3, 3]
-        if np.linalg.norm(current_pos - historical_pos) > float(search_radius):
-            continue
+    if translation_delta > max_translation_correction:
+        return odom_relative_transform, False
+    if rotation_delta_deg > max_rotation_correction_deg:
+        return odom_relative_transform, False
 
-        try:
-            source_copy = copy.deepcopy(current_pcd)
-            target_copy = copy.deepcopy(historical_pcds[historical_idx])
-
-            coarse = ransac_coarse_alignment(
-                source_copy,
-                target_copy,
-                current_fpfh,
-                historical_fpfh,
-                voxel_size,
-            )
-
-            if coarse.fitness < float(loop_fitness_thresh) * 0.5:
-                continue
-
-            # Point-to-plane ICP requires unit-length geometric normals on
-            # both source and target. Force correct normals on the
-            # deep-copied clouds used for refinement, since whatever
-            # normals were attached earlier (view rays or geometric) are
-            # not guaranteed to match what this stage needs.
-            _ensure_unit_geometric_normals(source_copy, voxel_size)
-            _ensure_unit_geometric_normals(target_copy, voxel_size)
-
-            refined = o3d.pipelines.registration.registration_icp(
-                source_copy,
-                target_copy,
-                max(float(voxel_size) * 1.5, 1e-4),
-                coarse.transformation,
-                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=50
-                ),
-            )
-
-            if refined.fitness >= float(loop_fitness_thresh):
-                candidates.append((
-                    historical_idx,
-                    refined.transformation,
-                    float(refined.fitness),
-                ))
-
-        except (RuntimeError, ValueError) as exc:
-            # RuntimeError: Open3D RANSAC/ICP failure on degenerate or
-            # mismatched feature/point data.
-            # ValueError: malformed inputs (e.g. empty point cloud) that
-            # slipped through upstream checks.
-            logger.debug(
-                "Loop-closure candidate against historical node %d rejected: %s",
-                historical_idx, exc,
-            )
-            continue
-
-    return candidates
+    return registration.transformation, True
 
 
-# ---------------------------------------------------------------------------
-# Full ICP + pose-graph pipeline
-# ---------------------------------------------------------------------------
-def run_icp_posegraph(
+def run_odom_anchored_registration(
     pointclouds: list[tuple[int, o3d.geometry.PointCloud]],
     odom_data: dict[int, np.ndarray],
     args: Any,
-) -> tuple[o3d.pipelines.registration.PoseGraph, list[int]]:
+) -> tuple[dict[int, np.ndarray], dict[str, int]]:
     """
-    Run pairwise ICP and global pose-graph optimisation.
+    Odom-anchored registration: timestamped odometry is the PRIMARY pose
+    source for every frame; ICP is only ever an optional, strongly-gated
+    local refinement; loop closure is gated at the same bar as local
+    refinement and weighted so it can only nudge, never dominate, the pose
+    graph. See odom-anchored-registration-fix-prompt.md for the full design.
+
+    Frames are included whenever they fall within `--odom_max_latency` of
+    odometry coverage -- ICP/registration quality is NEVER the reason a
+    frame is excluded. Frames without odometry coverage are dropped and
+    counted loudly (logged and printed), never silently.
+
+    Memory/perf safeguards (see design-doc section 6):
+      - Only the current and previous frame's normal-computed cloud are
+        held for sequential refinement (no whole-trajectory cloud list).
+      - Normals are computed exactly once per frame and carried forward.
+      - Loop-closure candidates are held in a `deque(maxlen=...)` bounded
+        window, and each closure is detected exactly once (the accepted
+        transform/fitness is reused directly as a pose-graph edge, never
+        re-computed for a summary count).
+
+    Args:
+        pointclouds: (timestamp, cloud) records already selected/bounded by
+            the caller (e.g. via `select_registration_frames`).
+        odom_data: dict mapping odometry timestamp -> 4x4 transform.
+        args: namespace exposing (at least) `voxel_size`, `odom_max_latency`,
+            `enable_icp_refinement`, `icp_dist_thresh`, `icp_fitness_thresh`,
+            `max_icp_translation_correction`, `max_icp_rotation_correction_deg`,
+            `enable_loop_closure`, `loop_closure_radius`,
+            `loop_closure_fitness_thresh`, `loop_closure_search_interval`,
+            `loop_closure_temporal_window`.
 
     Returns:
-        posegraph:
-            One node per successfully registered selected frame.
-
-        successful_original_indices:
-            Original indices into the caller's complete `pointclouds` list,
-            ordered exactly like `posegraph.nodes`. This preserves compatibility
-            with mesh, color_mesh, gazebo_world, tiles_3d, and color_tiles_3d.
+        (final_poses, stats)
+        final_poses: timestamp -> 4x4 transform that maps that frame's own
+            points into the merge/world frame (apply via `cloud.transform(pose)`).
+        stats: coverage counters for end-to-end logging -- total_selected,
+            dropped_no_odom, with_pose, icp_attempted, icp_accepted,
+            loop_closures_found, merged.
     """
+    if not pointclouds:
+        raise RuntimeError("No point clouds available for odom-anchored registration.")
+
+    if not odom_data:
+        raise RuntimeError(
+            "Odom-anchored registration requires odometry data, but no usable "
+            "odometry messages were found. Fix --odom_topic, or pass "
+            "--pc_frame_mode global if the point cloud is already published "
+            "in a fixed/global frame (no registration needed in that case)."
+        )
+
     voxel_size = _arg_float(args, "voxel_size", 0.05)
     if voxel_size <= 0.0:
         raise ValueError("--voxel_size must be greater than zero.")
 
-    icp_dist_thresh = _arg_float(args, "icp_dist_thresh", 0.2)
-    if icp_dist_thresh <= 0.0:
-        raise ValueError("--icp_dist_thresh must be greater than zero.")
-
-    icp_fitness_thresh = _arg_float(args, "icp_fitness_thresh", 0.6)
     odom_max_latency_ns = int(_arg_float(args, "odom_max_latency", 0.5) * 1e9)
 
-    frame_stride = _arg_int(args, "frame_stride", 0)
-    max_registration_frames = _arg_int(args, "max_registration_frames", 0)
-    merge_chunk_frames = _arg_int(args, "merge_chunk_frames", 16)
+    enable_icp_refinement = _arg_bool(args, "enable_icp_refinement", False)
+    icp_dist_thresh = _arg_float(args, "icp_dist_thresh", 0.2)
+    icp_fitness_thresh = _arg_float(args, "icp_fitness_thresh", 0.7)
+    max_translation_correction = _arg_float(args, "max_icp_translation_correction", 0.3)
+    max_rotation_correction_deg = _arg_float(args, "max_icp_rotation_correction_deg", 15.0)
 
-    selected_clouds, selected_original_indices = select_registration_frames(
-        pointclouds,
-        frame_stride=frame_stride,
-        max_registration_frames=max_registration_frames,
-    )
-
-    print(
-        f"Registration selection: {len(selected_clouds):,} / {len(pointclouds):,} "
-        f"frames (stride={frame_stride}, max={max_registration_frames})."
-    )
-    print(
-        f"Merge chunk setting: {merge_chunk_frames} frame(s). "
-        "Pipeline merge stages may use iter_registered_frame_chunks()."
-    )
+    enable_loop_closure = _arg_bool(args, "enable_loop_closure", False)
+    loop_closure_radius = _arg_float(args, "loop_closure_radius", 10.0)
+    # Defaults to the SAME bar as local ICP refinement (not a separate,
+    # looser value) -- a loop match that only clears a low bar is exactly
+    # the failure mode that lets visually similar but different locations
+    # get matched together.
+    loop_fitness_thresh = _arg_float(args, "loop_closure_fitness_thresh", icp_fitness_thresh)
+    loop_search_interval = max(1, _arg_int(args, "loop_closure_search_interval", 10))
+    loop_temporal_window = max(1, _arg_int(args, "loop_closure_temporal_window", 100))
 
     odom_ts_sorted = sorted(odom_data.keys())
-    enable_loop_closure = _arg_bool(args, "enable_loop_closure", False)
-    loop_search_interval = max(
-        1,
-        _arg_int(args, "loop_closure_search_interval", 10),
-    )
-    loop_closure_radius = _arg_float(args, "loop_closure_radius", 10.0)
-    loop_fitness_thresh = _arg_float(
-        args,
-        "loop_closure_fitness_thresh",
-        0.3,
-    )
+    total_selected = len(pointclouds)
 
-    posegraph = o3d.pipelines.registration.PoseGraph()
-    current_transform = np.eye(4, dtype=np.float64)
-    posegraph.nodes.append(
-        o3d.pipelines.registration.PoseGraphNode(current_transform.copy())
-    )
+    raw_odom_poses: dict[int, np.ndarray] = {}
+    dropped_no_odom = 0
+    kept_records: list[tuple[int, o3d.geometry.PointCloud]] = []
 
-    first_ts, first_raw = selected_clouds[0]
-    source = first_raw.voxel_down_sample(voxel_size)
-    if len(source.points) == 0:
-        raise RuntimeError("The first selected registration frame is empty.")
-
-    # Use the shared helper so behaviour matches compute_fpfh_descriptor
-    # and detect_loop_closure -- always a fresh geometric-normal estimate,
-    # never a stale/leftover view-ray normal.
-    _ensure_unit_geometric_normals(source, voxel_size)
-
-    previous_odom_transform: np.ndarray | None = None
-    if odom_ts_sorted:
-        closest_ts = get_closest_timestamp(first_ts, odom_ts_sorted)
-        if (
-            closest_ts is not None
-            and abs(closest_ts - first_ts) < odom_max_latency_ns
-        ):
-            previous_odom_transform = odom_data[closest_ts]
-
-    # These lists are indexed by successful pose-graph node index.
-    loop_clouds: list[o3d.geometry.PointCloud] = []
-    loop_fpfhs: list[o3d.pipelines.registration.Feature | None] = []
-    loop_poses: list[np.ndarray] = []
-
-    if enable_loop_closure:
-        loop_clouds.append(copy.deepcopy(source))
-        loop_fpfhs.append(compute_fpfh_descriptor(copy.deepcopy(source), voxel_size))
-        loop_poses.append(current_transform.copy())
-
-    # Local selected-frame indices. Convert these to original indices at return.
-    successful_selected_indices = [0]
-    loop_closures_found = 0
-
-    print("Registering point clouds...")
-    for selected_idx in tqdm(
-        range(1, len(selected_clouds)),
-        desc="Registering",
-    ):
-        timestamp, target_raw = selected_clouds[selected_idx]
-        target = target_raw.voxel_down_sample(voxel_size)
-        if len(target.points) == 0:
+    for timestamp, cloud in pointclouds:
+        pose = interpolate_odom_pose(timestamp, odom_ts_sorted, odom_data, odom_max_latency_ns)
+        if pose is None:
+            dropped_no_odom += 1
             continue
+        raw_odom_poses[timestamp] = pose
+        kept_records.append((timestamp, cloud))
 
-        # Same normal-safety guarantee as `source` above.
-        _ensure_unit_geometric_normals(target, voxel_size)
-
-        initial_guess = np.eye(4, dtype=np.float64)
-        current_odom_transform: np.ndarray | None = None
-
-        if odom_ts_sorted:
-            closest_ts = get_closest_timestamp(timestamp, odom_ts_sorted)
-            if (
-                closest_ts is not None
-                and abs(closest_ts - timestamp) < odom_max_latency_ns
-            ):
-                current_odom_transform = odom_data[closest_ts]
-                if previous_odom_transform is not None:
-                    initial_guess = (
-                        np.linalg.inv(previous_odom_transform)
-                        @ current_odom_transform
-                    )
-
-        try:
-            registration = o3d.pipelines.registration.registration_icp(
-                source,
-                target,
-                icp_dist_thresh,
-                initial_guess,
-                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=50
-                ),
-            )
-        except RuntimeError as exc:
-            # Open3D ICP raises RuntimeError on degenerate correspondence
-            # sets (e.g. no points within icp_dist_thresh of each other).
-            logger.debug(
-                "ICP failed for frame at selected index %d (timestamp=%d): %s",
-                selected_idx, timestamp, exc,
-            )
-            continue
-
-        if registration.fitness < icp_fitness_thresh:
-            continue
-
-        # Promote odometry only after a frame was actually accepted. If ICP
-        # fails, the next successful frame still receives an odometry delta
-        # relative to the last accepted source frame.
-        if current_odom_transform is not None:
-            previous_odom_transform = current_odom_transform
-
-        current_transform = registration.transformation @ current_transform
-        posegraph.nodes.append(
-            o3d.pipelines.registration.PoseGraphNode(
-                np.linalg.inv(current_transform)
-            )
+    if dropped_no_odom:
+        message = (
+            f"{dropped_no_odom} / {total_selected} frames had no odometry "
+            "coverage and were dropped"
         )
+        logger.warning(message)
+        print(f"Warning: {message}")
 
-        information = (
-            np.eye(6, dtype=np.float64)
-            * max(float(registration.fitness), 1e-6)
-        )
-
-        posegraph.edges.append(
-            o3d.pipelines.registration.PoseGraphEdge(
-                len(posegraph.nodes) - 2,
-                len(posegraph.nodes) - 1,
-                registration.transformation,
-                information,
-                uncertain=False,
-            )
-        )
-
-        successful_selected_indices.append(selected_idx)
-
-        if enable_loop_closure:
-            successful_node_idx = len(loop_clouds)
-            do_loop_search = (
-                successful_node_idx > 0
-                and successful_node_idx % loop_search_interval == 0
-            )
-
-            target_fpfh = (
-                compute_fpfh_descriptor(copy.deepcopy(target), voxel_size)
-                if do_loop_search
-                else None
-            )
-
-            loop_clouds.append(copy.deepcopy(target))
-            loop_fpfhs.append(target_fpfh)
-            loop_poses.append(current_transform.copy())
-
-            if do_loop_search and target_fpfh is not None:
-                closures = detect_loop_closure(
-                    current_idx=successful_node_idx,
-                    current_pcd=target,
-                    current_fpfh=target_fpfh,
-                    historical_pcds=loop_clouds,
-                    historical_fpfhs=loop_fpfhs,
-                    historical_poses=loop_poses,
-                    voxel_size=voxel_size,
-                    search_radius=loop_closure_radius,
-                    loop_fitness_thresh=loop_fitness_thresh,
-                )
-
-                for candidate_idx, transform, fitness in closures:
-                    # PATCHED: removed the previous "* 100.0" multiplier.
-                    # Loop-closure edges are now weighted on the SAME scale
-                    # as sequential ICP edges -- proportional only to their
-                    # own measured fitness, not artificially inflated 100x.
-                    # This prevents a single mediocre/incorrect loop match
-                    # from dominating the global pose-graph optimisation
-                    # and warping the whole trajectory.
-                    loop_information = (
-                        np.eye(6, dtype=np.float64)
-                        * max(fitness, 1e-6)
-                    )
-
-                    posegraph.edges.append(
-                        o3d.pipelines.registration.PoseGraphEdge(
-                            candidate_idx,
-                            len(posegraph.nodes) - 1,
-                            transform,
-                            loop_information,
-                            uncertain=True,
-                        )
-                    )
-                    loop_closures_found += 1
-
-        source = target
-
-    if len(posegraph.nodes) < 2:
-        raise RuntimeError(
-            "Registration failed - fewer than two frames met the ICP fitness "
-            "threshold. Try lowering --icp_fitness_thresh, increasing "
-            "--icp_dist_thresh, or reducing --frame_stride."
-        )
-
-    if enable_loop_closure:
-        print(f"Loop closures detected: {loop_closures_found}")
+    if not kept_records:
+        raise RuntimeError("No frames had usable odometry coverage; nothing to register.")
 
     print(
-        f"Optimising pose graph ({len(posegraph.nodes):,} nodes, "
-        f"{len(posegraph.edges):,} edges)..."
+        f"Coverage: frames selected={total_selected:,} -> frames with valid "
+        f"pose={len(kept_records):,} (odom_max_latency={odom_max_latency_ns / 1e9:.3f}s)."
     )
 
-    option = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=icp_dist_thresh,
-        edge_prune_threshold=0.25,
-        reference_node=0,
+    # FINAL poses start as a COPY of the raw odom poses. Refinement below is
+    # written into this copy only -- the raw dict is NEVER mutated -- so
+    # every relative-motion delta between consecutive frames is always
+    # computed from the untouched odometry chain, never from a refinement
+    # applied to the previous frame (see design-doc section 1).
+    final_poses: dict[int, np.ndarray] = dict(raw_odom_poses)
+    node_poses: list[np.ndarray] = [raw_odom_poses[ts].copy() for ts, _ in kept_records]
+    node_index_by_timestamp: dict[int, int] = {
+        ts: idx for idx, (ts, _) in enumerate(kept_records)
+    }
+
+    icp_attempted = 0
+    icp_accepted = 0
+    loop_closures_found = 0
+
+    # Only the current and previous frame's normal-computed cloud are ever
+    # held at once -- never a list growing with trajectory length.
+    prev_timestamp: int | None = None
+    prev_cloud_normals: o3d.geometry.PointCloud | None = None
+
+    # Bounded structure: holds only the most recent N candidate frames for
+    # loop closure, never a list that grows with bag length.
+    loop_history: deque[tuple[int, o3d.geometry.PointCloud, o3d.pipelines.registration.Feature | None]] = (
+        deque(maxlen=loop_temporal_window)
     )
 
-    try:
-        o3d.pipelines.registration.global_optimization(
-            posegraph,
-            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-            option,
-        )
-        print("Pose graph optimisation complete.")
-    except RuntimeError as exc:
-        # Open3D's global optimizer can raise RuntimeError on a
-        # numerically ill-conditioned pose graph (e.g. disconnected
-        # components, degenerate loop-closure edges). Falling back to
-        # the unoptimised, purely sequential poses keeps the pipeline
-        # usable instead of aborting the whole run.
-        logger.warning(
-            "Pose graph optimisation failed (%s); using unoptimised poses.",
-            exc,
-        )
+    # Sequential edges are stored alongside loop-closure edges so a single
+    # pose-graph optimisation pass (only run if a loop closure was actually
+    # found) can weight them far higher -- a bad loop match can then only
+    # nudge the graph, never disconnect or collapse it.
+    edges: list[tuple[int, int, np.ndarray, float, bool]] = []
+    SEQUENTIAL_EDGE_INFORMATION_SCALE = 50.0
 
-    successful_original_indices = [
-        selected_original_indices[selected_idx]
-        for selected_idx in successful_selected_indices
-    ]
+    needs_normals = enable_icp_refinement or enable_loop_closure
 
-    return posegraph, successful_original_indices
+    for position, (timestamp, cloud) in enumerate(
+        tqdm(kept_records, desc="Odom-anchored registration")
+    ):
+        current_cloud_normals: o3d.geometry.PointCloud | None = None
+        if needs_normals:
+            # Normals computed exactly once per frame; carried forward as
+            # `prev_cloud_normals` on the next iteration instead of being
+            # recomputed when this frame is later used as a "target".
+            current_cloud_normals = cloud.voxel_down_sample(voxel_size)
+            _ensure_unit_geometric_normals(current_cloud_normals, voxel_size)
+
+        if position > 0 and prev_timestamp is not None:
+            odom_relative = np.linalg.inv(raw_odom_poses[prev_timestamp]) @ raw_odom_poses[timestamp]
+            relative_transform = odom_relative
+
+            if (
+                enable_icp_refinement
+                and prev_cloud_normals is not None
+                and current_cloud_normals is not None
+            ):
+                icp_attempted += 1
+                refined_relative, accepted = refine_pose_with_icp(
+                    prev_cloud_normals,
+                    current_cloud_normals,
+                    odom_relative,
+                    icp_dist_thresh,
+                    icp_fitness_thresh,
+                    max_translation_correction,
+                    max_rotation_correction_deg,
+                )
+                if accepted:
+                    icp_accepted += 1
+                    relative_transform = refined_relative
+                    world_pose = raw_odom_poses[prev_timestamp] @ relative_transform
+                    final_poses[timestamp] = world_pose
+                    node_poses[position] = world_pose.copy()
+
+            edges.append((position - 1, position, relative_transform, SEQUENTIAL_EDGE_INFORMATION_SCALE, False))
+
+        if enable_loop_closure and current_cloud_normals is not None:
+            do_loop_search = position > 0 and position % loop_search_interval == 0
+            current_fpfh = None
+
+            if do_loop_search:
+                current_fpfh = compute_fpfh_descriptor(copy.deepcopy(current_cloud_normals), voxel_size)
+                current_pos_xyz = node_poses[position][:3, 3]
+
+                for hist_timestamp, hist_cloud, hist_fpfh in loop_history:
+                    if hist_fpfh is None:
+                        continue
+                    hist_index = node_index_by_timestamp[hist_timestamp]
+                    hist_pos_xyz = node_poses[hist_index][:3, 3]
+                    if np.linalg.norm(current_pos_xyz - hist_pos_xyz) > loop_closure_radius:
+                        continue
+
+                    try:
+                        source_copy = copy.deepcopy(current_cloud_normals)
+                        target_copy = copy.deepcopy(hist_cloud)
+                        coarse = ransac_coarse_alignment(
+                            source_copy, target_copy, current_fpfh, hist_fpfh, voxel_size
+                        )
+                        if coarse.fitness < loop_fitness_thresh * 0.5:
+                            continue
+
+                        refined = o3d.pipelines.registration.registration_icp(
+                            source_copy,
+                            target_copy,
+                            max(voxel_size * 1.5, 1e-4),
+                            coarse.transformation,
+                            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
+                        )
+                        # Detected exactly once: the accepted transform/fitness
+                        # is captured here and reused directly as the
+                        # pose-graph edge below -- never re-detected later
+                        # just to build a summary count.
+                        if refined.fitness >= loop_fitness_thresh:
+                            edges.append(
+                                (hist_index, position, refined.transformation, float(refined.fitness), True)
+                            )
+                            loop_closures_found += 1
+                    except (RuntimeError, ValueError) as exc:
+                        logger.debug("Loop-closure candidate rejected: %s", exc)
+                        continue
+
+            loop_history.append((timestamp, current_cloud_normals, current_fpfh))
+
+        prev_timestamp = timestamp
+        prev_cloud_normals = current_cloud_normals
+
+    if enable_icp_refinement:
+        print(f"ICP refinement: attempted {icp_attempted:,} pair(s), accepted {icp_accepted:,}.")
+    if enable_loop_closure:
+        print(f"Loop closures detected: {loop_closures_found:,}")
+
+    if enable_loop_closure and loop_closures_found > 0:
+        posegraph = o3d.pipelines.registration.PoseGraph()
+        for pose in node_poses:
+            posegraph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(pose)))
+
+        for source_idx, target_idx, transform, weight, uncertain in edges:
+            # Sequential edges are weighted significantly higher than any
+            # loop-closure edge (fixed high scale vs. the loop edge's own
+            # fitness, un-inflated) so a single bad loop-closure match can
+            # only nudge the graph, never disconnect or collapse it.
+            info_scale = weight if not uncertain else max(float(weight), 1e-6)
+            information = np.eye(6, dtype=np.float64) * info_scale
+            posegraph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    source_idx, target_idx, transform, information, uncertain=uncertain,
+                )
+            )
+
+        option = o3d.pipelines.registration.GlobalOptimizationOption(
+            max_correspondence_distance=icp_dist_thresh,
+            edge_prune_threshold=0.25,
+            reference_node=0,
+        )
+        try:
+            o3d.pipelines.registration.global_optimization(
+                posegraph,
+                o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+                o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+                option,
+            )
+            for timestamp, node_idx in node_index_by_timestamp.items():
+                final_poses[timestamp] = np.linalg.inv(posegraph.nodes[node_idx].pose)
+            print("Pose graph optimisation complete (loop closure applied).")
+        except RuntimeError as exc:
+            logger.warning(
+                "Pose graph optimisation failed (%s); using odom-anchored/ICP-refined poses.",
+                exc,
+            )
+
+    print(f"Merge: {len(kept_records):,} frame(s) will be merged into the combined cloud.")
+
+    stats = {
+        "total_selected": total_selected,
+        "dropped_no_odom": dropped_no_odom,
+        "with_pose": len(kept_records),
+        "icp_attempted": icp_attempted,
+        "icp_accepted": icp_accepted,
+        "loop_closures_found": loop_closures_found,
+        "merged": len(kept_records),
+    }
+    return final_poses, stats

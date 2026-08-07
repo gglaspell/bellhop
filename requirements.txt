@@ -25,6 +25,31 @@ py3dtiles>=4.0.0
 pymeshlab>=2023.12
 pyfqmr>=0.2.0
 
+# ── Keyframe-baked textured mesh (texture_baking pipeline only) ───────────
+# FIX: these were previously used by texture_baking's atlas_pipeline
+# modules (trimesh/trimesh.repair in meshgenerator.py's cull_invisible_faces,
+# pandas in atlas_pipeline/common/trajectory.py's load_trajectory, cv2 in
+# keyframeselector.py's sharpness scoring) but were never listed here,
+# so a fresh build would fail with ImportError the first time
+# texture_baking hit any of those code paths.
+# opencv-python-headless (not opencv-python) avoids pulling in GUI/X11
+# libraries the container doesn't need; libgl1/libegl1 are already
+# installed for Open3D's headless rendering, which is sufficient.
+trimesh>=4.0.0
+pandas>=2.0.0
+opencv-python-headless>=4.8.0
+
+# FIX: trimesh.repair (fill_holes, fix_normals -> fix_winding) requires
+# networkx internally to build/traverse the face-adjacency graph, but it
+# was never listed as a direct dependency. trimesh does not always pull
+# it in transitively depending on install extras, so a fresh build could
+# reach texture_baking's cull_invisible_faces() step and fail with
+# "ModuleNotFoundError: No module named 'networkx'" -- as a *silent*
+# warning inside fill_holes()'s existing try/except, and then as a hard
+# crash one line later at the unguarded fix_normals() call (see the
+# matching fix in meshgenerator.py's cull_invisible_faces()).
+networkx>=3.0
+
 # ── Progress bars ─────────────────────────────────────────────────────────
 tqdm>=4.65.0
 

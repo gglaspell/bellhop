@@ -8,10 +8,22 @@ tiles_3d.py and color_tiles_3d.py previously duplicated near-identical
 bag-reading loops, world-frame merge loops, and the entire ENU -> ECEF ->
 PLY -> py3dtiles-convert -> tileset.json tail end. That duplication meant
 any bugfix to the shared logic (e.g. the py3dtiles CLI flags, PLY writing,
-or the odometry-nearest-timestamp merge logic) had to be applied twice by
-hand, risking silent behavioral drift between the two pipelines. This
-module centralizes that shared logic so both pipelines call into one
+or the odometry pose-lookup merge logic) had to be applied twice by hand,
+risking silent behavioral drift between the two pipelines. This module
+centralizes that shared logic so both pipelines call into one
 implementation.
+
+PATCH NOTE (odom-anchored registration + frame-awareness):
+`transform_frame_to_world()` now looks up the view-ray sensor origin via
+`ros_io.interpolate_odom_pose()` (linear translation + SLERP rotation
+between bracketing odometry samples) instead of nearest-neighbor
+timestamp snapping, for consistency with `registration.run_odom_anchored_
+registration()`. Its signature/semantics are unchanged (`odom_max_ns` is
+still nanoseconds); callers passing an identity `transform_world` for a
+global/fixed-frame point cloud get a correct no-op transform while still
+getting sensor-origin-derived view rays for normal orientation, which is
+exactly the global-frame behaviour described in
+pointcloud-frame-check-prompt-2.md.
 """
 
 from __future__ import annotations
@@ -29,7 +41,7 @@ from tqdm import tqdm
 
 from .reconstruction import transform_local_enu_to_ecef
 from .registration import attach_view_rays_as_normals
-from .ros_io import TYPESTORE, get_closest_timestamp
+from .ros_io import TYPESTORE, interpolate_odom_pose
 
 
 # ---------------------------------------------------------------------------
@@ -81,13 +93,22 @@ def transform_frame_to_world(
     odom_max_ns: int | None = None,
 ) -> o3d.geometry.PointCloud:
     """
-    Voxel-downsample and transform one registered frame into world frame.
+    Voxel-downsample and transform one frame into the world/merge frame.
 
-    If odometry data is supplied and a close-enough timestamp match exists,
-    attach unnormalised view-ray "normals" (see
-    `registration.attach_view_rays_as_normals`) for later ground/obstacle
-    orientation. This is the exact merge-loop logic that was previously
-    duplicated between tiles_3d.py and color_tiles_3d.py.
+    `transform_world` is applied as-is: pass the odom-anchored (optionally
+    ICP-refined) pose for a local/moving-frame point cloud, or `np.eye(4)`
+    for a point cloud already published in a global/fixed frame (see
+    `ros_io.resolve_pc_frame_mode`) -- an identity transform is a correct
+    no-op, which is exactly "skip applying any per-frame transform" per
+    pointcloud-frame-check-prompt-2.md.
+
+    If odometry data is supplied and covers `timestamp` within
+    `odom_max_ns`, attach unnormalised view-ray "normals" (see
+    `registration.attach_view_rays_as_normals`) using an odometry pose
+    interpolated between the two bracketing samples (not nearest-neighbor
+    snapping) for later ground/obstacle orientation. This is the exact
+    merge-loop logic that was previously duplicated between tiles_3d.py and
+    color_tiles_3d.py.
     """
     pcd_world = pcd_raw.voxel_down_sample(voxel_size)
     pcd_world.transform(transform_world)
@@ -98,11 +119,11 @@ def transform_frame_to_world(
         and odom_ts_sorted
         and odom_max_ns is not None
     ):
-        closest_ts = get_closest_timestamp(timestamp, odom_ts_sorted)
-        if closest_ts is not None and abs(closest_ts - timestamp) < odom_max_ns:
-            attach_view_rays_as_normals(
-                pcd_world, odom_data[closest_ts][:3, 3]
-            )
+        interpolated_pose = interpolate_odom_pose(
+            timestamp, odom_ts_sorted, odom_data, odom_max_ns
+        )
+        if interpolated_pose is not None:
+            attach_view_rays_as_normals(pcd_world, interpolated_pose[:3, 3])
 
     return pcd_world
 

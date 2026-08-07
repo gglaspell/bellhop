@@ -23,6 +23,16 @@ CAVEAT: this only corrects for the odom-reported fixed-frame-to-base
 transform. It does NOT correct for a real sensor-to-base_link extrinsic
 offset (lever arm); that requires a separate static transform (e.g. from
 tf_static), which is out of scope here.
+
+PATCH NOTE (isotropic remeshing before UV/atlas work):
+Added an isotropic-remesh step (`MeshGenerator.remesh_isotropic()`)
+between `smooth_mesh()` and `cull_invisible_faces()`, gated by
+`--remesh`/`--no-remesh` (default on). Raw Poisson reconstruction tends to
+leave irregular, sometimes sliver-thin triangles; regularizing triangle
+topology before culling/UV-atlas packing/baking reduces UV-unwrap
+distortion, seams, and blurry/stretched baked textures. Mirrors the same
+technique already used by `mesh`/`color_mesh`/`gazebo_world` via
+`shared/reconstruction.py`'s `remesh_isotropic()`.
 """
 
 from __future__ import annotations
@@ -161,10 +171,20 @@ def run(args: argparse.Namespace) -> None:
         lambda_filter=args.smooth_lambda,
     )
 
+    mesh_for_culling = paths["cleaned_mesh"]
+    if args.remesh:
+        print("Regularizing mesh topology (isotropic remesh) for higher-quality UV unwrap...")
+        remeshed_path = intermediate_dir / "remeshed_mesh.ply"
+        mesh_gen.remesh_isotropic(
+            paths["cleaned_mesh"], remeshed_path,
+            smooth_iterations=args.remesh_smooth_iterations,
+        )
+        mesh_for_culling = remeshed_path
+
     print("Culling invisible faces...")
     culled_mesh_path = intermediate_dir / "culled_mesh.ply"
     mesh_gen.cull_invisible_faces(
-        paths["cleaned_mesh"], culled_mesh_path, keyframes, trajectory_csv,
+        mesh_for_culling, culled_mesh_path, keyframes, trajectory_csv,
         intrinsics, min_angle=args.cull_min_angle, target_faces=args.target_faces,
     )
 
@@ -260,6 +280,26 @@ def build_parser(sub):
     parser.add_argument("--smooth_method", choices=("taubin", "laplacian"), default="taubin")
     parser.add_argument("--smooth_iterations", type=int, default=5)
     parser.add_argument("--smooth_lambda", type=float, default=0.5)
+
+    parser.add_argument(
+        "--remesh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Isotropic remesh (regularize triangle size/shape via PyMeshLab) "
+            "after smoothing and before culling/UV-atlas work. Reduces "
+            "UV-unwrap distortion, seams, and stretched textures caused by "
+            "irregular Poisson-reconstruction triangles. Pass --no-remesh "
+            "to skip (requires pymeshlab; matches --remesh on mesh/color_mesh/"
+            "gazebo_world)."
+        ),
+    )
+    parser.add_argument(
+        "--remesh_smooth_iterations",
+        type=int,
+        default=5,
+        help="Laplacian smoothing iterations applied during isotropic remeshing.",
+    )
 
     parser.add_argument("--cull_min_angle", type=float, default=75.0)
     parser.add_argument("--target_faces", type=int, default=None)

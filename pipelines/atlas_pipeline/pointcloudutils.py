@@ -3,6 +3,27 @@ pipelines.atlas_pipeline.pointcloudutils
 =============================================
 Point-cloud merge / subsample / normal-estimation utilities for the
 atlas-bake pipeline.
+
+PATCH NOTE (frame-awareness, additive):
+See pointcloud-frame-check-prompt-2.md. `merge_point_clouds_from_bag()`
+previously used every point cloud frame's points completely unmodified,
+implicitly assuming the point cloud topic was already published in the
+same global/fixed frame as the trajectory (built from odometry). There was
+no check and no way to run against a raw, non-deskewed sensor-frame cloud.
+
+It now accepts a `frame_mode` argument ("global" default, preserving prior
+behaviour, or "local"). In "local" mode, each frame's points are
+transformed into the world/fixed frame using an odometry-derived pose
+*before* the frustum-visibility test and before merging, via the new
+`trajectory.get_pose_at_interpolated()` helper (linear translation + SLERP
+rotation between bracketing trajectory rows, not nearest-neighbor
+snapping). Frames with no trajectory coverage within `odom_max_latency`
+are dropped and counted loudly (logged and printed), never silently.
+
+CAVEAT: this only corrects for the odom-reported fixed-frame-to-base
+transform. It does NOT correct for a real sensor-to-base_link extrinsic
+offset (lever arm); that requires a separate static transform (e.g. from
+tf_static), which is out of scope here.
 """
 
 import logging
@@ -15,10 +36,10 @@ from rosbags.highlevel import AnyReader
 
 from .common.trajectory import (
     load_trajectory, build_trajectory_tree, parse_stem_timestamp, get_pose_at,
+    get_pose_at_interpolated, pose_to_matrix,
 )
 from .common.projection import world_to_optical, project_to_pixels
 from ..shared.ros_io import TYPESTORE, convert_ros_pc2_to_o3d
-
 
 # FIX: Range-dependent ROR/SOR outlier filtering. Previously a single
 # global (ror_radius, ror_min_neighbors, sor_neighbors, sor_std_ratio)
@@ -316,13 +337,29 @@ class PointCloudProcessor:
         self, bag_path, pc_topic, keyframes, traj_df, traj_tree, intrinsics,
         out_ply, out_ts, min_frame_points=100,
         ror_radius=0.0, ror_min_neighbors=10, sor_neighbors=20, sor_std_ratio=2.0,
+        frame_mode="global", odom_max_latency=0.5,
     ):
-        """Stream pc_topic once; keep only clouds visible in >=1 keyframe."""
+        """Stream pc_topic once; keep only clouds visible in >=1 keyframe.
+
+        `frame_mode`:
+          - "global" (default): points are assumed already published in the
+            same global/fixed frame as `traj_df` and are used unchanged --
+            this is the pipeline's original behaviour.
+          - "local": each frame's points are transformed into the world
+            frame via an odometry-derived pose (interpolated from `traj_df`,
+            linear translation + SLERP rotation) before the frustum-
+            visibility test and before merging. Frames without trajectory
+            coverage within `odom_max_latency` seconds are dropped and
+            counted loudly.
+        """
         fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
         w, h = intrinsics["width"], intrinsics["height"]
         kf_ts = np.array([ts for _, ts, _ in keyframes])
 
         pts_list, ts_list = [], []
+        candidate_frames = 0
+        dropped_no_pose = 0
+
         with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
             connections = [c for c in reader.connections if c.topic == pc_topic]
             for connection, ts_ns, raw in reader.messages(connections=connections):
@@ -331,11 +368,35 @@ class PointCloudProcessor:
                 if not np.any(nearby):
                     continue
 
+                candidate_frames += 1
+
                 msg = reader.deserialize(raw, connection.msgtype)
                 cloud = convert_ros_pc2_to_o3d(msg)
                 if cloud is None or len(cloud.points) < min_frame_points:
                     continue
                 points = np.asarray(cloud.points)
+
+                if frame_mode == "local":
+                    # The point cloud is in a local/moving sensor or base
+                    # frame: transform it into the world/fixed frame using
+                    # an odometry-derived pose before it is used for
+                    # visibility testing or merging. CAVEAT: this only
+                    # corrects for the odom-reported fixed-frame-to-base
+                    # transform, not a real sensor-to-base_link extrinsic
+                    # offset (lever arm) -- see module docstring.
+                    pose = get_pose_at_interpolated(traj_df, ts_sec, max_latency=odom_max_latency)
+                    if pose is None:
+                        dropped_no_pose += 1
+                        continue
+                    pos, rot = pose
+                    transform = pose_to_matrix(pos, rot)
+                    homogeneous = np.hstack(
+                        [points, np.ones((len(points), 1), dtype=np.float64)]
+                    )
+                    points = (transform @ homogeneous.T).T[:, :3]
+                # else: frame_mode == "global" -- points already share the
+                # trajectory's fixed frame; used unchanged (original
+                # behaviour).
 
                 visible = False
                 for kf_ts_val in kf_ts[nearby]:
@@ -350,6 +411,14 @@ class PointCloudProcessor:
 
                 pts_list.append(points)
                 ts_list.append(np.full(len(points), ts_sec, dtype=np.float64))
+
+        if frame_mode == "local" and dropped_no_pose:
+            message = (
+                f"{dropped_no_pose} / {candidate_frames} candidate frames had no "
+                "trajectory/odometry coverage and were dropped"
+            )
+            logging.warning(message)
+            print(f"Warning: {message}")
 
         if not pts_list:
             raise ValueError("No visible point clouds found in bag for these keyframes.")

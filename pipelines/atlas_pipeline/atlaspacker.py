@@ -2,6 +2,20 @@
 colormesh3d.atlas_pipeline.atlaspacker
 =========================================
 UV atlas packing for the atlas-bake pipeline.
+
+FIX (broken import): this module previously imported from a top-level
+`colormesh3d.common` package that does not exist in this repository:
+
+    from colormesh3d.common.trajectory import ...
+    from colormesh3d.common.projection import ...
+
+Leftover from the prior standalone "colormesh3d" project this pipeline
+was merged in from. The actual package here is
+`pipelines.atlas_pipeline.common`. Since `AtlasPacker` is imported
+directly by `texture_baking.py`, this raised `ModuleNotFoundError: No
+module named 'colormesh3d'` immediately on pipeline invocation. Switched
+to the relative-import pattern already used correctly by
+`keyframeselector.py` and `pointcloudutils.py` in this same package.
 """
 
 import pickle
@@ -13,8 +27,8 @@ from scipy.sparse.csgraph import connected_components
 from tqdm import tqdm
 import logging
 
-from colormesh3d.common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
-from colormesh3d.common.projection import world_to_optical
+from .common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
+from .common.projection import world_to_optical
 
 
 class AtlasPacker:
@@ -296,7 +310,6 @@ class AtlasPacker:
             faces=final_f,
             visual=trimesh.visual.TextureVisuals(uv=final_uv),
         )
-
         out_mesh.export(str(out_path))
 
         atlas_data = {
@@ -304,6 +317,5 @@ class AtlasPacker:
             'final_w': self.base_size,
             'final_h': final_h,
         }
-
         with open(out_path.parent / 'atlas_charts.pkl', 'wb') as f:
             pickle.dump(atlas_data, f)

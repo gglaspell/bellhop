@@ -2,6 +2,20 @@
 colormesh3d.atlas_pipeline.viewassignment
 ============================================
 Per-face view assignment for the atlas-bake pipeline.
+
+FIX (broken import): this module previously imported from a top-level
+`colormesh3d.common` package that does not exist in this repository:
+
+    from colormesh3d.common.trajectory import ...
+    from colormesh3d.common.projection import ...
+
+Leftover from the prior standalone "colormesh3d" project this pipeline
+was merged in from. The actual package here is
+`pipelines.atlas_pipeline.common`. Since `ViewAssigner` is imported
+directly by `texture_baking.py`, this raised `ModuleNotFoundError: No
+module named 'colormesh3d'` immediately on pipeline invocation. Switched
+to the relative-import pattern already used correctly by
+`keyframeselector.py` and `pointcloudutils.py` in this same package.
 """
 
 from pathlib import Path
@@ -14,8 +28,8 @@ from scipy.sparse import csr_matrix
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from colormesh3d.common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
-from colormesh3d.common.projection import world_to_optical, project_to_pixels
+from .common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
+from .common.projection import world_to_optical, project_to_pixels
 
 
 def _build_face_adjacency_csr(mesh):
@@ -45,23 +59,23 @@ def _smooth_assignments(mesh, assignments, iterations=3, adj_sparse=None):
     + collections.Counter majority vote. Uses the CSR adjacency's
     (indptr, indices) arrays to build an explicit (src, dst) edge-list view
     of the graph once, then per iteration:
-      1. Filters edges whose destination face is currently assigned
-         (assignments[dst] != -1) -- unassigned neighbours never
-         contribute votes, exactly as `if assignments[j] != -1` did.
-      2. Tallies (src_face, neighbour_label) vote counts via a single
-         np.unique on a combined integer key, which is equivalent to
-         building a Counter per face but done for every face at once.
-      3. For each face, picks the label with the *strictly highest* count.
-         Ties are broken by NumPy's stable sort order (first-encountered
-         label among the tied maximum), which matches
-         `Counter.most_common(1)` -- Python's Counter also preserves
-         insertion order among equal counts (insertion order here being
-         neighbour-list order, i.e. ascending neighbour face id, identical
-         to the original `neighbours[face_i]` list order since indices are
-         stored in ascending order within each CSR row).
-      4. Applies the exact same strict majority rule
-         `majority_count > len(nbrs) / 2` (using each face's true degree,
-         not just the number of assigned neighbours) before reassigning.
+    1. Filters edges whose destination face is currently assigned
+       (assignments[dst] != -1) -- unassigned neighbours never
+       contribute votes, exactly as `if assignments[j] != -1` did.
+    2. Tallies (src_face, neighbour_label) vote counts via a single
+       np.unique on a combined integer key, which is equivalent to
+       building a Counter per face but done for every face at once.
+    3. For each face, picks the label with the *strictly highest* count.
+       Ties are broken by NumPy's stable sort order (first-encountered
+       label among the tied maximum), which matches
+       `Counter.most_common(1)` -- Python's Counter also preserves
+       insertion order among equal counts (insertion order here being
+       neighbour-list order, i.e. ascending neighbour face id, identical
+       to the original `neighbours[face_i]` list order since indices are
+       stored in ascending order within each CSR row).
+    4. Applies the exact same strict majority rule
+       `majority_count > len(nbrs) / 2` (using each face's true degree,
+       not just the number of assigned neighbours) before reassigning.
     Faces with 0 neighbours, or whose neighbours are all unassigned (-1),
     are left unchanged, matching the original `continue` branches.
     """
@@ -158,10 +172,10 @@ class ViewAssigner:
         would silently degrade to a one-line warning instead of surfacing
         during debugging. We now catch only the specific, genuinely
         expected failure modes for this operation:
-          - OSError / PermissionError: diag_path is not writable (disk
-            full, read-only output directory, path collision, etc.)
-          - ValueError: malformed coverage/color data that trimesh or
-            matplotlib legitimately reject (e.g. NaN in `coverage`).
+        - OSError / PermissionError: diag_path is not writable (disk
+          full, read-only output directory, path collision, etc.)
+        - ValueError: malformed coverage/color data that trimesh or
+          matplotlib legitimately reject (e.g. NaN in `coverage`).
         Anything else (AttributeError, TypeError, ImportError, etc.)
         propagates immediately so it is not masked during development.
         """

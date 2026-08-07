@@ -7,11 +7,95 @@ This preserves the validated hybrid method:
 - estimate local ground height
 - query a vertical OcTree slice above ground
 - produce occupied / free / unknown Nav2 pixels
+
+PATCH NOTE (frame-awareness + odom-anchored local-frame support):
+See pointcloud-frame-check-prompt-2.md and
+odom-anchored-registration-fix-prompt.md.
+
+Previously this pipeline *assumed* --pc_topic was already published in a
+global/fixed frame and passed points into the OcTree unchanged, with only
+a code comment ("Do not transform points again unless you verify its
+frame_id") flagging the risk if that assumption were ever wrong. That
+assumption is now verified (or overridden) at runtime:
+
+- The point cloud's frame_id is detected (or overridden via
+  --pc_frame_mode) and classified as 'global' (odom/map/world) or 'local'
+  (a moving sensor/base frame), via `ros_io.resolve_pc_frame_mode`.
+- 'global' frames: unchanged behaviour -- points are passed into the
+  OcTree as-is; odometry is used only to supply the ray-casting sensor
+  origin.
+- 'local' frames: each frame's points are now transformed into the
+  world/fixed frame using an odometry pose *before* OcTree insertion and
+  before ground/height-map building, so og_map can run directly against a
+  raw sensor-frame point cloud instead of requiring a pre-deskewed one.
+  The odom pose is looked up via `ros_io.interpolate_odom_pose()`
+  (linear translation + SLERP rotation between bracketing samples), not
+  nearest-neighbor snapping -- matching the pose-lookup approach used by
+  the odom-anchored mesh/tiles pipelines. og_map has no ICP/registration
+  step of its own and doesn't need one here: odometry is already the sole
+  and sufficient pose source for this ray-casting/height-map method, so
+  no loop closure or ICP refinement is added.
+- Frames with no odometry coverage within --odom_max_latency are dropped
+  and counted loudly (logger.warning + print), never silently, mirroring
+  the coverage-visibility requirement in odom-anchored-registration-fix-prompt.md.
+- CAVEAT: the frame check only detects whether the cloud is already in a
+  fixed/global frame -- it does NOT correct for a real sensor-to-base_link
+  extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
+
+CLEANUP NOTE: `_nearest_index()` has been removed. It was og_map's local,
+nearest-neighbor-only odometry lookup helper; it's now replaced everywhere
+by the shared, interpolating `ros_io.interpolate_odom_pose()`.
+
+FIX (coverage-log accuracy): the end-of-run coverage summary previously
+computed "frames with valid pose" as `selected_frames - dropped_no_odom`.
+That overcounts whenever frames are also skipped earlier for malformed
+messages or too few finite points -- those frames never reach the
+odometry check at all, so subtracting only `dropped_no_odom` credited
+them as if they *had* gotten a valid pose. An explicit `frames_with_pose`
+counter is now incremented only when `interpolate_odom_pose()` actually
+returns a pose, so the logged count is exact.
+
+PERF NOTE (OcTree insertion speedup): step [2/6] previously called
+`obstacle_tree.insertPointCloud(points, sensor_origin, -1.0)` once per
+frame with no other options set. Profiling on dense LiDAR bags (e.g.
+Ouster, ~65k-131k pts/frame) showed this step dominating total runtime,
+for three compounding reasons, all fixed below without changing the
+occupancy semantics used by the validated hybrid method:
+
+1. Every single `insertPointCloud()` call recomputed inner-node occupancy
+   from scratch (the default `lazy_eval=False`). With thousands of
+   frames, that per-call recomputation cost dwarfs the actual ray
+   casting. `--octree_lazy_eval` (default: on) defers that recomputation
+   via `lazy_eval=True`, and a single `obstacle_tree.updateInnerOccupancy()`
+   call is made once after the frame loop, before the tree is queried in
+   step [5/6] (querying a tree with stale inner nodes under lazy_eval
+   would silently return wrong occupancy -- see OctoMap's own docs on
+   this flag).
+2. Full-resolution points (not yet voxel-downsampled) were ray-cast into
+   the tree every frame -- the existing `--voxel_size` downsample only
+   ran *after* insertion, on the copy kept for ground/obstacle
+   separation. `--octree_discretize` (default: off, opt-in) sets
+   `discretize=True`, which snaps the scan onto the octree's own voxel
+   grid before casting rays, collapsing many same-voxel points into one
+   ray. It's opt-in rather than default because it changes which exact
+   points contribute to each ray (occupied nodes still take precedence
+   over free ones, per OctoMap's `computeDiscreteUpdate()`), so it's a
+   deliberate accuracy/speed tradeoff left to the operator.
+3. Every ray was cast the complete beam length (`maxrange=-1.0`), so
+   distant returns cost proportionally more voxel traversals. The new
+   `--octree_max_range` (default: -1.0, i.e. unchanged/unlimited) lets an
+   operator cap beam length when far returns aren't needed for the
+   ground/obstacle band being mapped.
+
+None of these defaults change output for a bag run with all-default
+flags except `--octree_lazy_eval`, which is now on by default because it
+is mathematically a no-op reordering (deferred recomputation, immediately
+reconciled via `updateInnerOccupancy()` before any query) rather than an
+approximation.
 """
 
 from __future__ import annotations
 
-import bisect
 import logging
 import struct
 import sys
@@ -31,35 +115,12 @@ from scipy.ndimage import binary_closing, label
 from .shared.preflight import check_topics
 from .shared.ros_io import (
     get_odom_transform_matrix,
+    interpolate_odom_pose,
     pointcloud2_to_numpy,
+    resolve_pc_frame_mode,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _nearest_index(
-    timestamps: list[float],
-    target_time: float,
-) -> int | None:
-    """Return the nearest timestamp index."""
-    if not timestamps:
-        return None
-
-    index = bisect.bisect_left(timestamps, target_time)
-
-    if index == 0:
-        return 0
-
-    if index >= len(timestamps):
-        return len(timestamps) - 1
-
-    before = timestamps[index - 1]
-    after = timestamps[index]
-
-    if abs(target_time - before) <= abs(after - target_time):
-        return index - 1
-
-    return index
 
 
 def _separate_ground_and_obstacles(
@@ -173,6 +234,7 @@ def _build_ground_height_map(
         (grid_y[valid], grid_x[valid]),
         ground_points[valid, 2],
     )
+
     np.add.at(
         counts,
         (grid_y[valid], grid_x[valid]),
@@ -269,7 +331,6 @@ def _process_row_block(
                     break
 
                 free_evidence = True
-
             else:
                 if free_evidence:
                     block[local_y, grid_x] = 254
@@ -401,16 +462,28 @@ def run(args) -> None:
         bag_path,
         [args.pc_topic, args.odom_topic],
     )
-
     if missing_topics:
         sys.exit(f"Error: Required topics not found: {missing_topics}")
 
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
+    frame_mode = resolve_pc_frame_mode(bag_path, args.pc_topic, args.pc_frame_mode)
+    if frame_mode == "local":
+        logger.info(
+            "Point cloud is in a local/moving frame: each frame will be "
+            "transformed into the world frame via an odom-derived pose "
+            "before OcTree insertion and ground/height-map building."
+        )
+    else:
+        logger.info(
+            "Point cloud is already in a global/fixed frame: points will be "
+            "passed into the OcTree unchanged; odometry supplies only the "
+            "ray-casting sensor origin."
+        )
+
     logger.info("[1/6] Loading odometry from '%s'...", args.odom_topic)
 
-    odom_times: list[float] = []
-    odom_poses: list[np.ndarray] = []
+    odom_data: dict[int, np.ndarray] = {}
 
     with AnyReader([bag_path], default_typestore=typestore) as reader:
         odom_connections = [
@@ -436,23 +509,21 @@ def run(args) -> None:
                 continue
 
             if transform is not None:
-                odom_times.append(timestamp * 1e-9)
-                odom_poses.append(transform)
+                odom_data[timestamp] = transform
 
-    if not odom_times:
+    if not odom_data:
         sys.exit("Error: No valid odometry messages found.")
 
-    order = np.argsort(odom_times)
-    odom_times = [odom_times[index] for index in order]
-    odom_poses = np.asarray(
-        [odom_poses[index] for index in order],
-        dtype=np.float64,
-    )
+    odom_ts_sorted = sorted(odom_data)
+    odom_max_latency_ns = int(args.odom_max_latency * 1e9)
 
-    logger.info("Loaded %d odometry poses.", len(odom_times))
+    logger.info("Loaded %d odometry poses.", len(odom_data))
 
     logger.info(
-        "[2/6] Building 3D OcTree (octree_res=%s m)...", args.octree_res
+        "[2/6] Building 3D OcTree (octree_res=%s m, lazy_eval=%s, "
+        "discretize=%s, max_range=%s)...",
+        args.octree_res, args.octree_lazy_eval, args.octree_discretize,
+        args.octree_max_range,
     )
 
     obstacle_tree = pyoctomap.OcTree(args.octree_res)
@@ -462,6 +533,8 @@ def run(args) -> None:
     seen_frames = 0
     selected_frames = 0
     valid_frames = 0
+    frames_with_pose = 0
+    dropped_no_odom = 0
 
     frame_stride = max(1, int(args.frame_stride))
     max_frames = max(0, int(args.max_frames))
@@ -505,30 +578,54 @@ def run(args) -> None:
             if len(points) == 0:
                 continue
 
-            timestamp_seconds = timestamp * 1e-9
+            # Odometry is the sole pose source for this pipeline (no ICP/
+            # registration step exists or is needed here). Pose is looked
+            # up by interpolating between the two bracketing odometry
+            # samples closest in time (linear translation + SLERP
+            # rotation), not nearest-neighbor snapping.
+            odom_pose = interpolate_odom_pose(
+                timestamp, odom_ts_sorted, odom_data, odom_max_latency_ns
+            )
 
-            odom_index = _nearest_index(odom_times, timestamp_seconds)
-
-            if odom_index is None:
+            if odom_pose is None:
+                dropped_no_odom += 1
                 continue
 
-            if (
-                abs(odom_times[odom_index] - timestamp_seconds)
-                > args.odom_max_latency
-            ):
-                continue
+            frames_with_pose += 1
+            sensor_origin = odom_pose[:3, 3].astype(np.float64)
 
-            sensor_origin = odom_poses[odom_index][:3, 3].astype(np.float64)
+            if frame_mode == "local":
+                # The point cloud is in a local/moving sensor or base
+                # frame: transform it into the world/fixed frame using the
+                # odom-derived pose before it is used for anything else.
+                # CAVEAT: this only corrects for the odom-reported
+                # fixed-frame-to-base transform. It does NOT correct for a
+                # real sensor-to-base_link extrinsic offset (lever arm);
+                # that requires a separate static transform (e.g. from
+                # tf_static), which is out of scope here.
+                homogeneous_points = np.hstack(
+                    [points, np.ones((len(points), 1), dtype=np.float64)]
+                )
+                points = (odom_pose @ homogeneous_points.T).T[:, :3]
+            # else: frame_mode == "global" -- the cloud is already in a
+            # global/fixed frame (odom/map/world). Keep the validated
+            # coordinate convention: pass points through unchanged and use
+            # odometry only to supply the ray-casting sensor origin.
 
-            # IMPORTANT:
-            # Keep the coordinate convention from your validated script.
-            # The deskewed point cloud is intentionally passed unchanged.
-            # Do not transform points again unless you verify its frame_id.
             try:
+                # PERF: lazy_eval defers inner-node occupancy recomputation
+                # until updateInnerOccupancy() is called once below (see
+                # PERF NOTE at module top) instead of on every frame;
+                # discretize (opt-in) snaps the scan onto the octree's own
+                # voxel grid before ray casting to avoid redundant rays
+                # from a still-full-resolution frame; max_range caps beam
+                # length (unlimited by default, matching prior behavior).
                 obstacle_tree.insertPointCloud(
                     points,
                     sensor_origin,
-                    -1.0,
+                    max_range=args.octree_max_range,
+                    lazy_eval=args.octree_lazy_eval,
+                    discretize=args.octree_discretize,
                 )
             except RuntimeError as exc:
                 # pyoctomap raises RuntimeError on malformed/degenerate
@@ -550,13 +647,32 @@ def run(args) -> None:
                 point_chunks.append(chunk)
                 valid_frames += 1
 
+    if dropped_no_odom:
+        message = (
+            f"{dropped_no_odom} / {selected_frames} selected frames had no "
+            "odometry coverage and were dropped"
+        )
+        logger.warning(message)
+        print(f"Warning: {message}")
+
     if not point_chunks:
         sys.exit("Error: No valid point clouds processed.")
 
     logger.info(
-        "Processed %d valid frames from %d bag frames.",
-        valid_frames, seen_frames,
+        "Coverage: frames read=%d -> frames selected=%d -> frames with valid "
+        "pose=%d -> frames merged=%d.",
+        seen_frames, selected_frames, frames_with_pose, valid_frames,
     )
+
+    if args.octree_lazy_eval:
+        # REQUIRED when lazy_eval=True was used above: inner-node occupancy
+        # was deferred on every insertPointCloud() call, so the tree's
+        # inner nodes are stale until this single reconciliation pass runs.
+        # Step [5/6] queries obstacle_tree.search()/getOccupancy() below,
+        # so this must happen before that step, not after.
+        logger.info("Reconciling deferred OcTree inner-node occupancy...")
+        obstacle_tree.updateInnerOccupancy()
+
     logger.info("OcTree: %d nodes.", obstacle_tree.size())
 
     logger.info("[3/6] Separating ground from obstacles...")
@@ -675,6 +791,23 @@ def build_parser(sub):
         "--odom_topic",
         default="/dlio/odom_node/odom",
     )
+
+    parser.add_argument(
+        "--pc_frame_mode",
+        choices=["auto", "global", "local"],
+        default="auto",
+        help=(
+            "Point-cloud frame handling. 'auto' detects the frame_id of the "
+            "first message on --pc_topic and classifies odom/map/world as "
+            "global (points passed through unchanged) and anything else as "
+            "local (each frame is transformed into the world frame via an "
+            "odom-derived pose before OcTree insertion). Use 'global'/'local' "
+            "to override when a bag's frame_id is missing, wrong, or empty -- "
+            "e.g. force 'local' to run directly against a raw, non-deskewed "
+            "sensor-frame point cloud."
+        ),
+    )
+
     parser.add_argument("--octree_res", type=float, default=0.1)
     parser.add_argument("--grid_res", type=float, default=0.05)
     parser.add_argument("--slope_deg", type=float, default=15.0)
@@ -695,6 +828,7 @@ def build_parser(sub):
         default=0,
         help="Maximum selected PointCloud2 frames; 0 means all.",
     )
+
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min_cluster_size", type=int, default=20)
     parser.add_argument("--closing_iters", type=int, default=1)
@@ -703,6 +837,51 @@ def build_parser(sub):
         "--odom_max_latency",
         type=float,
         default=0.5,
+    )
+
+    # PERF: new flags controlling OcTree insertion (step [2/6]). See the
+    # "PERF NOTE" in this file's module docstring for why each exists.
+    parser.add_argument(
+        "--octree_max_range",
+        type=float,
+        default=-1.0,
+        help=(
+            "Max ray-casting beam length (m) per point during OcTree "
+            "insertion; -1.0 (default) casts the complete beam, matching "
+            "prior behavior. Capping this reduces per-frame insertion cost "
+            "on bags with long-range returns not needed for the mapped "
+            "z_min/z_max band."
+        ),
+    )
+    parser.add_argument(
+        "--octree_lazy_eval",
+        action="store_true",
+        default=True,
+        help=(
+            "Defer OcTree inner-node occupancy recomputation during "
+            "insertion (default: on) and reconcile it once via "
+            "updateInnerOccupancy() after all frames are inserted, instead "
+            "of recomputing it on every single frame. This does not change "
+            "output; it only reorders when the recomputation happens."
+        ),
+    )
+    parser.add_argument(
+        "--no-octree_lazy_eval",
+        dest="octree_lazy_eval",
+        action="store_false",
+        help="Disable --octree_lazy_eval (recompute inner nodes every frame).",
+    )
+    parser.add_argument(
+        "--octree_discretize",
+        action="store_true",
+        default=False,
+        help=(
+            "Snap each frame onto the OcTree's own voxel grid before ray "
+            "casting (default: off, opt-in). Collapses multiple same-voxel "
+            "points into one ray per frame, which speeds up insertion on "
+            "dense point clouds at the cost of using a discretized "
+            "approximation of each frame rather than every raw point."
+        ),
     )
 
     parser.set_defaults(func=run)
