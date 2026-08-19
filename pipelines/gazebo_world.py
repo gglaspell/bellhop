@@ -61,6 +61,15 @@ voxel-downsampled) every `--merge_chunk_frames` frames, so
 `--merge_chunk_frames` now does what its help text always claimed and the
 merged cloud's size stays close to the true, no-redundant-points size
 throughout the merge rather than only being reduced once at the very end.
+
+REFACTOR NOTE (shared chunked-merge helper):
+The chunked-merge helper this pipeline ported from `mesh.py` (above) was
+copy-pasted here as `_append_chunk()` -- byte-for-byte identical to
+`mesh.py`'s `append_chunk()` and to `tiles_3d.py`'s own independently
+copy-pasted `_append_chunk()`. All three copies now live in one place,
+`shared/merge_utils.py` (`merge_chunk()`), imported from there instead of
+redefined locally, so a future fix to the chunking logic only needs to be
+made once.
 """
 
 import argparse
@@ -73,6 +82,7 @@ import open3d as o3d
 from rosbags.highlevel import AnyReader
 from tqdm import tqdm
 
+from .shared.merge_utils import merge_chunk
 from .shared.preflight import check_topics
 from .shared.reconstruction import clean_point_cloud, create_mesh, level_floor
 from .shared.registration import (
@@ -88,6 +98,7 @@ from .shared.ros_io import (
     interpolate_odom_pose,
     resolve_pc_frame_mode,
 )
+
 
 # ---------------------------------------------------------------------------
 # Gazebo template strings
@@ -184,33 +195,6 @@ def _export_gazebo(mesh: o3d.geometry.TriangleMesh, out_dir: Path,
 
 
 # ---------------------------------------------------------------------------
-# PERF FIX: bounded, chunked merge helper (ported from mesh.py's
-# append_chunk()). Frames accumulate in `chunk` until it reaches
-# `chunk_size`, at which point they're concatenated together and
-# voxel-downsampled once as a batch, keeping `target`'s point count close
-# to its true (deduplicated) size throughout the merge instead of only
-# reducing it once at the very end.
-# ---------------------------------------------------------------------------
-def _append_chunk(
-    target: o3d.geometry.PointCloud,
-    chunk: list[o3d.geometry.PointCloud],
-    voxel_size: float,
-) -> o3d.geometry.PointCloud:
-    """Merge a bounded chunk and immediately downsample it."""
-    if not chunk:
-        return target
-    local = o3d.geometry.PointCloud()
-    for cloud in chunk:
-        local += cloud
-    chunk.clear()
-    if len(target.points):
-        target += local
-    else:
-        target = local
-    return target.voxel_down_sample(voxel_size)
-
-
-# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def run(args) -> None:
@@ -237,7 +221,7 @@ def run(args) -> None:
     if missing:
         sys.exit(
             f"Error: Required topics missing from bag: {missing}\n"
-            "Check topic names with: ros2 bag info <bag_path>"
+            "Check topic names with: ros2 bag info <bag>"
         )
 
     # -- Read bag ------------------------------------------------------------
@@ -302,14 +286,14 @@ def run(args) -> None:
 
     # -- Merge with view-ray normals -------------------------------------------
     # PERF FIX: frames are now batched into a bounded `chunk` and flushed via
-    # `_append_chunk()` every `args.merge_chunk_frames` frames, instead of
-    # calling `pcd_combined += pcd_world` unconditionally for every single
-    # selected frame. This keeps the merged cloud's point count close to its
-    # true (voxel-deduplicated) size throughout the merge, so `+=` cost stays
-    # roughly linear in the number of frames instead of growing toward O(n^2)
-    # as an ever-larger, never-reduced cloud gets re-concatenated on every
-    # iteration. `--merge_chunk_frames` now actually does what its help text
-    # always described.
+    # the shared `merge_chunk()` helper every `args.merge_chunk_frames`
+    # frames, instead of calling `pcd_combined += pcd_world` unconditionally
+    # for every single selected frame. This keeps the merged cloud's point
+    # count close to its true (voxel-deduplicated) size throughout the
+    # merge, so `+=` cost stays roughly linear in the number of frames
+    # instead of growing toward O(n^2) as an ever-larger, never-reduced
+    # cloud gets re-concatenated on every iteration. `--merge_chunk_frames`
+    # now actually does what its help text always described.
     print("Merging registered frames (chunked, bounded memory)...")
     pcd_combined = o3d.geometry.PointCloud()
     chunk: list[o3d.geometry.PointCloud] = []
@@ -335,10 +319,10 @@ def run(args) -> None:
         merged_frame_count += 1
 
         if len(chunk) >= chunk_size:
-            pcd_combined = _append_chunk(pcd_combined, chunk, args.voxel_size)
+            pcd_combined = merge_chunk(pcd_combined, chunk, args.voxel_size)
             gc.collect()
 
-    pcd_combined = _append_chunk(pcd_combined, chunk, args.voxel_size)
+    pcd_combined = merge_chunk(pcd_combined, chunk, args.voxel_size)
 
     print(f"Merge: {merged_frame_count:,} frame(s) actually merged into the combined cloud.")
     del selected_frames, pose_by_timestamp
@@ -362,7 +346,6 @@ def run(args) -> None:
         np.asarray(pcd_clean.normals, dtype=np.float64).copy()
         if pcd_clean.has_normals() else None
     )
-
     estimate_geometric_normals_oriented(pcd_clean, args.voxel_size, view_rays)
 
     # -- Reconstruct --------------------------------------------------------------
@@ -399,19 +382,18 @@ def build_parser(sub):
         "gazebo_world",
         help="ROS 2 bag -> Poisson mesh -> Gazebo simulation world"
     )
-
     p.add_argument("bagpath", help="Path to the ROS 2 bag directory.")
     p.add_argument("outputdir", help="Output directory.")
 
     # Topics
     p.add_argument("--pc_topic", default="points",
-        help="PointCloud2 topic (default: points).")
+                    help="PointCloud2 topic (default: points).")
     p.add_argument("--odom_topic", default=None,
-        help=(
-            "Odometry topic (nav_msgs/Odometry). Required unless the "
-            "point cloud is already published in a global/fixed frame "
-            "(see --pc_frame_mode)."
-        ))
+                    help=(
+                        "Odometry topic (nav_msgs/Odometry). Required unless the "
+                        "point cloud is already published in a global/fixed frame "
+                        "(see --pc_frame_mode)."
+                    ))
     p.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -427,9 +409,9 @@ def build_parser(sub):
 
     # Gazebo
     p.add_argument("--model_name", default="bag_environment",
-        help="Gazebo model name (default: bag_environment).")
+                    help="Gazebo model name (default: bag_environment).")
     p.add_argument("--gazebo_material", default="Gazebo/Grey",
-        help="Gazebo material (e.g. Gazebo/White, Gazebo/Wood).")
+                    help="Gazebo material (e.g. Gazebo/White, Gazebo/Wood).")
 
     # Registration
     p.add_argument("--voxel_size", type=float, default=0.05)
@@ -470,9 +452,9 @@ def build_parser(sub):
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
     p.add_argument("--frame_stride", type=int, default=1,
-        help="Process every Nth frame.")
+                    help="Process every Nth frame.")
     p.add_argument("--max_registration_frames", type=int, default=0,
-        help="Cap total frames used for registration (0 = all).")
+                    help="Cap total frames used for registration (0 = all).")
     p.add_argument(
         "--merge_chunk_frames", type=int, default=16,
         help=(
@@ -486,13 +468,13 @@ def build_parser(sub):
 
     # Reconstruction
     p.add_argument("--poisson_depth", type=int, default=0,
-        help="Poisson depth (0 = auto).")
+                    help="Poisson depth (0 = auto).")
     p.add_argument("--min_density_percentile", type=float, default=1.0,
-        help="Bottom %% of Poisson vertex densities to trim (default 1.0).")
+                    help="Bottom %% of Poisson vertex densities to trim (default 1.0).")
     p.add_argument("--distance_multiplier", type=float, default=3.0,
-        help="Adaptive vertex distance trim multiplier (default 3.0).")
+                    help="Adaptive vertex distance trim multiplier (default 3.0).")
     p.add_argument("--max_vertex_distance", type=float, default=0.0,
-        help="Hard cap on vertex distance (m); 0 = disabled.")
+                    help="Hard cap on vertex distance (m); 0 = disabled.")
     # FIX: previously registered as two separate manual flags,
     # `--remesh` (store_true) and `--no_remesh` (dest="remesh",
     # store_false, underscore). gui.py always emits the hyphenated
@@ -510,13 +492,13 @@ def build_parser(sub):
         help="Run isotropic remesh + smooth after Poisson (default: on).",
     )
     p.add_argument("--remesh_smooth_iterations", type=int, default=5,
-        help="Laplacian smooth iterations during remesh (default 5).")
+                    help="Laplacian smooth iterations during remesh (default 5).")
     p.add_argument("--decimate_target", type=float, default=None,
-        help="<=1.0 = fraction of triangles; >1 = absolute count; None = skip.")
+                    help="<=1.0 = fraction of triangles; >1 = absolute count; None = skip.")
     p.add_argument("--curvature_percentile", type=float, default=80.0,
-        help="Percentile threshold for curvature-aware decimation (default 80.0).")
+                    help="Percentile threshold for curvature-aware decimation (default 80.0).")
     p.add_argument("--curvature_protect_rings", type=int, default=1,
-        help="Ring dilation for curvature protection (default 1).")
+                    help="Ring dilation for curvature protection (default 1).")
     p.add_argument("--level_floor", action="store_true", default=False)
     p.add_argument("--workers", type=int, default=4)
 

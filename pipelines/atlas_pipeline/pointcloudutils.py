@@ -1,8 +1,15 @@
 """
 pipelines.atlas_pipeline.pointcloudutils
-=============================================
+=========================================
 Point-cloud merge / subsample / normal-estimation utilities for the
 atlas-bake pipeline.
+
+REFACTOR NOTE (moved from atlas_pipeline/common to shared):
+Previously imported trajectory/projection helpers from `.common.trajectory`
+and `.common.projection` (i.e. `atlas_pipeline/common/`). That package has
+been merged into `shared/` (see `shared/trajectory.py`'s module
+docstring), so this now imports from `..shared.trajectory` and
+`..shared.projection` instead. No behavior change.
 
 PATCH NOTE (frame-awareness, additive):
 See pointcloud-frame-check-prompt-2.md. `merge_point_clouds_from_bag()`
@@ -34,11 +41,11 @@ import open3d as o3d
 from scipy.spatial import cKDTree
 from rosbags.highlevel import AnyReader
 
-from .common.trajectory import (
+from ..shared.trajectory import (
     load_trajectory, build_trajectory_tree, parse_stem_timestamp, get_pose_at,
     get_pose_at_interpolated, pose_to_matrix,
 )
-from .common.projection import world_to_optical, project_to_pixels
+from ..shared.projection import world_to_optical, project_to_pixels
 from ..shared.ros_io import TYPESTORE, convert_ros_pc2_to_o3d
 
 # FIX: Range-dependent ROR/SOR outlier filtering. Previously a single
@@ -342,15 +349,15 @@ class PointCloudProcessor:
         """Stream pc_topic once; keep only clouds visible in >=1 keyframe.
 
         `frame_mode`:
-          - "global" (default): points are assumed already published in the
-            same global/fixed frame as `traj_df` and are used unchanged --
-            this is the pipeline's original behaviour.
-          - "local": each frame's points are transformed into the world
-            frame via an odometry-derived pose (interpolated from `traj_df`,
-            linear translation + SLERP rotation) before the frustum-
-            visibility test and before merging. Frames without trajectory
-            coverage within `odom_max_latency` seconds are dropped and
-            counted loudly.
+        - "global" (default): points are assumed already published in the
+          same global/fixed frame as `traj_df` and are used unchanged --
+          this is the pipeline's original behaviour.
+        - "local": each frame's points are transformed into the world
+          frame via an odometry-derived pose (interpolated from `traj_df`,
+          linear translation + SLERP rotation) before the frustum-
+          visibility test and before merging. Frames without trajectory
+          coverage within `odom_max_latency` seconds are dropped and
+          counted loudly.
         """
         fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
         w, h = intrinsics["width"], intrinsics["height"]
@@ -430,16 +437,6 @@ class PointCloudProcessor:
         if len(merged.points) == 0:
             raise ValueError("Merged point cloud unexpectedly has 0 points.")
 
-        # FIX: Previously this block called remove_radius_outlier() /
-        # remove_statistical_outlier() and immediately re-indexed `merged`
-        # and `all_ts` with no check on whether any points survived. Under
-        # aggressive ror_radius/ror_min_neighbors or sor_std_ratio settings,
-        # `idx` can come back empty, silently producing a 0-point merged
-        # cloud and a 0-length timestamp array that are then written to disk
-        # with no error and no diagnostic -- downstream stages would fail
-        # far later with a much more confusing error (or silently produce
-        # an empty mesh/atlas). This mirrors the existing, correctly-guarded
-        # behavior already used in merge_point_clouds() above.
         # FIX: switched from a single global ROR/SOR pass to range-adaptive
         # filtering bucketed by distance from the nearest trajectory pose
         # (traj_df/traj_tree are already available here). Tighter thresholds
@@ -458,7 +455,6 @@ class PointCloudProcessor:
             ror_radius=ror_radius, ror_min_neighbors=ror_min_neighbors,
             sor_neighbors=sor_neighbors, sor_std_ratio=sor_std_ratio,
         )
-
         if len(merged.points) == 0:
             raise ValueError(
                 "Range-adaptive ROR/SOR removed all points. "

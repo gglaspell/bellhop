@@ -1,22 +1,18 @@
 """
-colormesh3d.atlas_pipeline.visibilityfilter
-==============================================
+pipelines.atlas_pipeline.visibilityfilter
+===========================================
 Point-cloud visibility filtering (camera-frustum + keyframe-timestamp
 proximity) for the atlas-bake pipeline.
 
-FIX (broken import): this module previously imported from a top-level
-`colormesh3d.common` package that does not exist in this repository:
-
-    from colormesh3d.common.trajectory import ...
-    from colormesh3d.common.projection import ...
-
-Leftover from the prior standalone "colormesh3d" project this pipeline
-was merged in from. The actual package here is
-`pipelines.atlas_pipeline.common`. This module is not currently imported
-by `texture_baking.py` (so the bad import wasn't triggering a crash at
-run time), but it's fixed here for consistency with the rest of the
-`atlas_pipeline` package and so it doesn't break the moment something
-starts importing it.
+REFACTOR NOTE (moved from atlas_pipeline/common to shared):
+Previously imported trajectory/projection helpers from `.common.trajectory`
+and `.common.projection` (i.e. `atlas_pipeline/common/`). That package has
+been merged into `shared/` (see `shared/trajectory.py`'s module
+docstring), so this now imports from `..shared.trajectory` and
+`..shared.projection` instead. No behavior change. This module is not
+currently imported by `texture_baking.py`, but it's fixed here for
+consistency with the rest of the `atlas_pipeline` package and so it
+doesn't break the moment something starts importing it.
 """
 
 import logging
@@ -24,10 +20,10 @@ import logging
 import numpy as np
 import open3d as o3d
 
-from .common.trajectory import (
+from ..shared.trajectory import (
     load_trajectory, build_trajectory_tree, get_pose_at, parse_stem_timestamp,
 )
-from .common.projection import world_to_optical, project_to_pixels
+from ..shared.projection import world_to_optical, project_to_pixels
 
 
 class VisibilityFilter:

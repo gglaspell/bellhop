@@ -1,21 +1,25 @@
 """
-colormesh3d.atlas_pipeline.atlaspacker
+pipelines.atlas_pipeline.atlaspacker
 =========================================
 UV atlas packing for the atlas-bake pipeline.
 
-FIX (broken import): this module previously imported from a top-level
-`colormesh3d.common` package that does not exist in this repository:
+FIX (broken import): this module was still importing from
+`atlas_pipeline.common`, a package that no longer exists in this
+repository -- it was merged into the pipeline-wide `shared/` package
+(see `shared/trajectory.py`'s module docstring for the full migration
+rationale). The stale imports were:
 
-    from colormesh3d.common.trajectory import ...
-    from colormesh3d.common.projection import ...
+    from .common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
+    from .common.projection import world_to_optical
 
-Leftover from the prior standalone "colormesh3d" project this pipeline
-was merged in from. The actual package here is
-`pipelines.atlas_pipeline.common`. Since `AtlasPacker` is imported
-directly by `texture_baking.py`, this raised `ModuleNotFoundError: No
-module named 'colormesh3d'` immediately on pipeline invocation. Switched
-to the relative-import pattern already used correctly by
-`keyframeselector.py` and `pointcloudutils.py` in this same package.
+Since `AtlasPacker` is imported directly by `texture_baking.py`, this
+raised `ModuleNotFoundError: No module named
+'pipelines.atlas_pipeline.common'` the moment the atlas-packing step
+was reached. Switched to the two-level relative-import pattern already
+used correctly by every other module in this package
+(`keyframeselector.py`, `meshgenerator.py`, `pointcloudutils.py`,
+`viewassignment.py`, `visibilityfilter.py`), which reach up into
+`pipelines/shared/` instead of the deleted `pipelines/atlas_pipeline/common/`.
 """
 
 import pickle
@@ -27,8 +31,8 @@ from scipy.sparse.csgraph import connected_components
 from tqdm import tqdm
 import logging
 
-from .common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
-from .common.projection import world_to_optical
+from ..shared.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
+from ..shared.projection import world_to_optical
 
 
 class AtlasPacker:
@@ -310,6 +314,7 @@ class AtlasPacker:
             faces=final_f,
             visual=trimesh.visual.TextureVisuals(uv=final_uv),
         )
+
         out_mesh.export(str(out_path))
 
         atlas_data = {
@@ -317,5 +322,6 @@ class AtlasPacker:
             'final_w': self.base_size,
             'final_h': final_h,
         }
+
         with open(out_path.parent / 'atlas_charts.pkl', 'wb') as f:
             pickle.dump(atlas_data, f)

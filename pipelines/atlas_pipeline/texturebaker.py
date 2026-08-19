@@ -1,4 +1,16 @@
-"""Texture baking with photometric normalisation and vertex-normal OBJ export."""
+"""Texture baking with photometric normalisation and vertex-normal OBJ export.
+
+PATCH NOTE (ATAK references removed):
+This module's normal-injection helper previously described itself in terms
+of ATAK specifically ("so that renderers such as ATAK can rely on..."). The
+texture-baking pipeline no longer targets ATAK at all -- it stops after
+producing the baked OBJ + PNG texture (see texture_baking.py's own PATCH
+NOTE) -- so the comment has been reworded to describe the OBJ-normals fix
+generically. The actual behavior (injecting explicit `vn` lines and
+`f v/vt/vn` face indices into the exported OBJ) is unchanged and still
+worth doing: it makes the mesh's vertex normals explicit for any OBJ
+viewer instead of relying on the viewer to infer them from winding order.
+"""
 import trimesh
 import trimesh.repair
 import numpy as np
@@ -14,7 +26,7 @@ def _inject_normals_into_obj(obj_path: Path, mesh: trimesh.Trimesh) -> None:
     """Post-process the exported OBJ to add ``vn`` lines and update face format.
 
     Converts ``f v/vt v/vt v/vt`` entries to ``f v/vt/vn v/vt/vn v/vt/vn`` so
-    that renderers such as ATAK can rely on explicit vertex normals rather than
+    that OBJ viewers can rely on explicit vertex normals rather than
     inferring winding order (Fix 2 from normal-fix spec).
     """
     trimesh.repair.fix_normals(mesh)
@@ -155,6 +167,7 @@ class TextureBaker:
             raise FileNotFoundError(
                 f"Could not read reference keyframe image: {self.kf[0][0]}"
             )
+
         ref_lab = cv2.cvtColor(ref_img, cv2.COLOR_BGR2LAB)
         ref_l_mean, ref_l_std = cv2.meanStdDev(ref_lab[:, :, 0])
 

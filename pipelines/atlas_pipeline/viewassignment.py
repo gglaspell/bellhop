@@ -1,21 +1,14 @@
 """
-colormesh3d.atlas_pipeline.viewassignment
-============================================
+pipelines.atlas_pipeline.viewassignment
+=========================================
 Per-face view assignment for the atlas-bake pipeline.
 
-FIX (broken import): this module previously imported from a top-level
-`colormesh3d.common` package that does not exist in this repository:
-
-    from colormesh3d.common.trajectory import ...
-    from colormesh3d.common.projection import ...
-
-Leftover from the prior standalone "colormesh3d" project this pipeline
-was merged in from. The actual package here is
-`pipelines.atlas_pipeline.common`. Since `ViewAssigner` is imported
-directly by `texture_baking.py`, this raised `ModuleNotFoundError: No
-module named 'colormesh3d'` immediately on pipeline invocation. Switched
-to the relative-import pattern already used correctly by
-`keyframeselector.py` and `pointcloudutils.py` in this same package.
+REFACTOR NOTE (moved from atlas_pipeline/common to shared):
+Previously imported trajectory/projection helpers from `.common.trajectory`
+and `.common.projection` (i.e. `atlas_pipeline/common/`). That package has
+been merged into `shared/` (see `shared/trajectory.py`'s module
+docstring), so this now imports from `..shared.trajectory` and
+`..shared.projection` instead. No behavior change.
 """
 
 from pathlib import Path
@@ -28,8 +21,8 @@ from scipy.sparse import csr_matrix
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from .common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
-from .common.projection import world_to_optical, project_to_pixels
+from ..shared.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
+from ..shared.projection import world_to_optical, project_to_pixels
 
 
 def _build_face_adjacency_csr(mesh):

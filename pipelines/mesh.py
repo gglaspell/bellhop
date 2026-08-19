@@ -25,6 +25,15 @@ pointcloud-frame-check-prompt-2.md.
 CLEANUP NOTE: removed an unused `get_closest_timestamp` import left over
 from before the view-ray sensor-origin lookup was upgraded to
 `interpolate_odom_pose()`.
+
+REFACTOR NOTE (shared chunked-merge helper):
+This module's `append_chunk()` was byte-for-byte duplicated in both
+`gazebo_world.py` (as `_append_chunk`) and `tiles_3d.py` (as
+`_append_chunk`) -- both pipelines independently ran into and fixed the
+same unbounded-merge performance bug by copy-pasting this exact function
+from here. It now lives in `shared/merge_utils.py` as `merge_chunk()` and
+is imported from there by all three pipelines, so a future fix to the
+chunking logic itself only needs to be made once.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ from rosbags.highlevel import AnyReader
 from tqdm import tqdm
 
 from .shared.mesh_utils import apply_height_colormap
+from .shared.merge_utils import merge_chunk
 from .shared.preflight import check_topics
 from .shared.reconstruction import clean_point_cloud, create_mesh, level_floor
 from .shared.registration import (
@@ -122,25 +132,6 @@ def read_registration_data(
     return frames, odom_data
 
 
-def append_chunk(
-    target: o3d.geometry.PointCloud,
-    chunk: list[o3d.geometry.PointCloud],
-    voxel_size: float,
-) -> o3d.geometry.PointCloud:
-    """Merge a bounded chunk and immediately downsample it."""
-    if not chunk:
-        return target
-    local = o3d.geometry.PointCloud()
-    for cloud in chunk:
-        local += cloud
-    chunk.clear()
-    if len(target.points):
-        target += local
-    else:
-        target = local
-    return target.voxel_down_sample(voxel_size)
-
-
 def merge_registered_frames(
     bag_path: Path,
     args: argparse.Namespace,
@@ -192,12 +183,12 @@ def merge_registered_frames(
                 chunk.append(cloud)
                 merged_frame_count += 1
                 if len(chunk) >= chunk_size:
-                    merged = append_chunk(merged, chunk, args.voxel_size)
+                    merged = merge_chunk(merged, chunk, args.voxel_size)
                     gc.collect()
             except Exception:
                 continue
 
-    merged = append_chunk(merged, chunk, args.voxel_size)
+    merged = merge_chunk(merged, chunk, args.voxel_size)
     print(f"Merge: {merged_frame_count:,} frame(s) actually merged into the combined cloud.")
     return merged, merged_frame_count
 
@@ -235,9 +226,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"Coverage: frames read = {len(frames):,}.")
 
     if args.odom_topic and not odom_data:
-        print(
-            "Warning: odom topic was set but no usable messages were found."
-        )
+        print("Warning: odom topic was set but no usable messages were found.")
 
     selected_frames, _original_indices = select_registration_frames(
         frames, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
@@ -291,7 +280,6 @@ def run(args: argparse.Namespace) -> None:
         if pcd_clean.has_normals()
         else None
     )
-
     estimate_geometric_normals_oriented(pcd_clean, args.voxel_size, view_rays)
 
     print("Running Poisson reconstruction...")
@@ -327,8 +315,8 @@ def run(args: argparse.Namespace) -> None:
             colored_ply_path,
             colormap=args.height_colormap,
         )
-    print(f"Saved false-color PLY: {colored_ply}")
-    
+        print(f"Saved false-color PLY: {colored_ply}")
+
     print("Done.")
 
 
@@ -360,6 +348,7 @@ def build_parser(sub):
             "override when a bag's frame_id is missing, wrong, or empty."
         ),
     )
+
     parser.add_argument("--voxel_size", type=float, default=0.10)
     parser.add_argument("--min_frame_points", type=int, default=100)
     parser.add_argument(
@@ -384,6 +373,7 @@ def build_parser(sub):
         default=16,
         help="Frames merged before each voxel reduction.",
     )
+
     parser.add_argument("--odom_max_latency", type=float, default=0.5)
 
     parser.add_argument(
@@ -458,8 +448,8 @@ def build_parser(sub):
         choices=["jet", "hot", "cool", "gray"],
         default=None,
         help=(
-            "Also export a textured false-color OBJ, MTL, and PNG bundle "
-            "whose color represents mesh height."
+            "Also export a per-vertex height-colored PLY (baked directly "
+            "into the mesh's vertex colors)."
         ),
     )
 

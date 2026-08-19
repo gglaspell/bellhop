@@ -36,7 +36,7 @@ def main() -> None:
             "  gazebo_world    Gazebo simulation world (.stl + .sdf + .world)\n"
             "  tiles_3d        Georeferenced Cesium 3D Tiles (tileset.json)\n"
             "  color_tiles_3d  Colored georeferenced Cesium 3D Tiles\n"
-            "  texture_baking  Keyframe-baked textured mesh (ATAK zip)\n"
+            "  texture_baking  Keyframe-baked textured mesh (OBJ + texture)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

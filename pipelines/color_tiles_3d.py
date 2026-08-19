@@ -5,7 +5,10 @@ color_tiles_3d.py - ROS 2 bag -> registered COLORED point cloud
 
 This pipeline is the union of color_mesh coloring logic and tiles_3d
 georeferencing logic. No mesh is produced; the output is a colored
-ECEF point cloud converted to tileset.json via py3dtiles.
+ECEF point cloud converted to tileset.json via py3dtiles. Because there
+is no mesh reconstruction step at all, this pipeline never had a
+`--remesh` flag to begin with -- there is nothing here for remeshing to
+destroy.
 
 Pipeline:
 1. Pre-flight: verify required topics.
@@ -17,12 +20,29 @@ Pipeline:
 6. Merge colored frames (gray-fill filtering + voxel downsample).
 7. Clean merged cloud.
 8. ENU -> ECEF conversion.
-9. Write colored ECEF PLY -> py3dtiles convert -> tileset.json.
+9. Write colored ECEF PLY per LOD level -> py3dtiles convert -> one
+   tileset_<name>/ directory per level (coarse/medium/fine by default).
 
 REFACTOR NOTE: Bag-reading, world-frame merge, and the ENU->ECEF->PLY->
 py3dtiles tail-end logic live in `shared/tiles_common.py` and are shared
 with `tiles_3d.py`, so bugfixes to that shared logic no longer need to be
 applied twice by hand.
+
+REFACTOR NOTE (color-projection overlap with color_mesh.py):
+The camera-projection coloring math, the fallback-gray guarantee, the
+"is this pixel a placeholder gray" heuristic, and the Open3D
+`+`/`+=`-avoiding merge helper were previously duplicated almost verbatim
+in `color_mesh.py`. That duplication is exactly how this file ended up
+missing the total-color-loss fix for several revisions after it landed in
+`color_mesh.py` (see the BUGFIX history this note replaces). Those four
+pieces now live in `shared/color_projection.py` and are imported from
+there, so this pipeline's "is this gray" detection is guaranteed to stay
+in lockstep with color_mesh.py's -- a future fix to either only needs to
+be made once. Only `_merge_colored_pcds()` (this pipeline's specific
+"merge a list of per-frame colored clouds with gray-fill filtering, then
+voxel-downsample" combination) remains local to this file, now built on
+top of the shared `is_gray_fill()`/`remove_gray_fill_near_color()`
+helpers instead of an inline copy of the same logic.
 
 PATCH NOTE (odom-anchored registration + frame-awareness):
 See odom-anchored-registration-fix-prompt.md and
@@ -41,29 +61,6 @@ to `mesh.py`, `color_mesh.py`, `gazebo_world.py`, and `tiles_3d.py`:
   there is no separate registration transform in this branch to create a
   frame mismatch.
 
-BUGFIX (total color loss, matching fix_pointcloud_color_loss_prompt.md
-already applied to color_mesh.py, but never ported here):
-- Root cause 1: any frame that did not find a camera image within
-  --max_time_diff previously entered the merge via `pcd_combined +=
-  pcd_world` with NO colors array set at all -- `_color_pcd_from_image`
-  was only ever called on frames that matched a camera image in time.
-- Root cause 2: Open3D's `PointCloud.__add__`/`__iadd__` clears colors on
-  the ENTIRE result if either operand lacks a colors array (or the
-  arrays mismatch length). Since `pcd_combined` accumulated purely
-  uncolored frames throughout the main loop (root cause 1), the single
-  `pcd_combined += merged_color` after the loop -- combining an
-  uncolored `pcd_combined` with a colored `merged_color` -- silently
-  wiped out ALL color, even though some frames had been successfully
-  camera-colored. This fired any time point-cloud and camera frame rates
-  weren't perfectly aligned (i.e. essentially always), not just as an
-  edge case.
-Fixed exactly as in color_mesh.py: every frame that reaches the merge
-now gets an explicit neutral-gray fallback color if it wasn't
-camera-colored (`_fill_fallback_color`), and all merging is done via
-manual numpy concatenation (`_concat_point_clouds`) instead of Open3D's
-`+`/`+=` operators, which are never invoked and are therefore immune to
-this behavior.
-
 BUGFIX (camera_info_topic validation order):
 `--camera_topic` requires `--camera_info_topic`, and this was already
 checked -- but the check ran AFTER `required` (which unconditionally
@@ -76,6 +73,18 @@ clear, purpose-built "--camera_topic requires --camera_info_topic"
 message below it was ever reached. The validation now runs first, before
 `required` is built, so the intended message is the one users actually
 see.
+
+FEATURE NOTE (three LOD tileset layers):
+The final export step now calls
+`tiles_common.georeference_and_export_lod_tilesets()` instead of the
+single-layer `georeference_and_export_tileset()`. The same cleaned/merged
+colored cloud is voxel-downsampled at three densities (coarse/medium/fine
+by default, configurable via `--lod_multipliers`) and each density is
+written into its own `tileset_<name>/` subfolder under `outputdir`, so a
+Cesium viewer can offer a quality/performance toggle between layers
+instead of being stuck with one fixed-resolution tileset. Color is
+preserved at every LOD level since `voxel_down_sample()` averages colors
+of merged points rather than dropping them.
 """
 
 import sys
@@ -84,9 +93,14 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 from PIL import Image
-from scipy.spatial import cKDTree
-from scipy.spatial.transform import Rotation as R
 
+from .shared.color_projection import (
+    color_pcd_from_image,
+    concat_point_clouds,
+    fill_fallback_color,
+    is_gray_fill,
+    remove_gray_fill_near_color,
+)
 from .shared.preflight import check_topics
 from .shared.reconstruction import clean_point_cloud
 from .shared.registration import (
@@ -105,115 +119,32 @@ from .shared.ros_io import (
     resolve_pc_frame_mode,
 )
 from .shared.tiles_common import (
-    georeference_and_export_tileset,
+    DEFAULT_LOD_LEVELS,
+    georeference_and_export_lod_tilesets,
     read_bag_topics,
     transform_frame_to_world,
 )
 
-# Neutral fallback color used for any point/frame that could not be
-# camera-colored (no image in time tolerance, no intrinsics yet, or a
-# point that didn't project into the image). Matches color_mesh.py's
-# FALLBACK_GRAY exactly so the two pipelines' "is this a placeholder
-# color" heuristics (std/mean-based gray detection) stay consistent.
-FALLBACK_GRAY = (0.5, 0.5, 0.5)
+
+# ---------------------------------------------------------------------------
+# CLI helper: parse "--lod_multipliers" into (name, multiplier) pairs
+# ---------------------------------------------------------------------------
+def _build_lod_levels(names: list[str], multipliers_csv: str) -> tuple[tuple[str, float], ...]:
+    try:
+        multipliers = [float(x) for x in multipliers_csv.split(",")]
+    except ValueError:
+        sys.exit(f"Error: --lod_multipliers must be a comma-separated list of numbers, got: {multipliers_csv!r}")
+    if len(multipliers) != len(names):
+        sys.exit(
+            f"Error: --lod_multipliers must have exactly {len(names)} values "
+            f"(one per LOD level: {', '.join(names)}), got {len(multipliers)}."
+        )
+    return tuple(zip(names, multipliers))
 
 
 # ---------------------------------------------------------------------------
-# Color projection (identical to color_mesh; kept local to avoid import cycle)
+# Merge: per-frame colored clouds -> gray-fill filtered, voxel-downsampled
 # ---------------------------------------------------------------------------
-def _color_pcd_from_image(
-    pcd: o3d.geometry.PointCloud,
-    img: Image.Image,
-    camera_pose: np.ndarray,
-    intrinsics: tuple,
-    color_min_depth: float = 0.1,
-    color_max_depth: float | None = None,
-) -> o3d.geometry.PointCloud:
-    """Project camera image colours onto *pcd* in-place; returns pcd."""
-    fx, fy, cx, cy, img_w, img_h = intrinsics
-    pts = np.asarray(pcd.points)
-    img_arr = np.asarray(img)
-    cam_pos = camera_pose[:3, 3]
-    cam_rot = R.from_matrix(camera_pose[:3, :3])
-
-    body = cam_rot.inv().apply(pts - cam_pos)
-    opt_x = -body[:, 1]
-    opt_y = -body[:, 2]
-    opt_z = body[:, 0]
-    depth = np.linalg.norm(body, axis=1)
-
-    valid = (opt_z > 1e-6) & (depth >= color_min_depth)
-    if color_max_depth is not None:
-        valid &= depth <= color_max_depth
-
-    z_safe = np.where(opt_z > 1e-6, opt_z, 1e-6)
-    u = fx * (opt_x / z_safe) + cx
-    v = fy * (opt_y / z_safe) + cy
-    valid &= (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
-
-    colors = np.full((len(pts), 3), FALLBACK_GRAY, dtype=np.float64)
-    if np.any(valid):
-        ui = np.clip(u[valid].astype(np.int32), 0, img_w - 1)
-        vi = np.clip(v[valid].astype(np.int32), 0, img_h - 1)
-        colors[valid] = img_arr[vi, ui] / 255.0
-
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    return pcd
-
-
-def _fill_fallback_color(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
-    """Guarantee `pcd` has an explicit colors array before it can be merged.
-
-    BUGFIX: any frame that skips camera projection entirely (no camera
-    image within --max_time_diff, or color_mode is off) must still get
-    an explicit neutral-gray colors array of matching length before it
-    reaches `_concat_point_clouds`, so a mix of colored and uncolored
-    frames never triggers Open3D's "either operand lacks colors -> whole
-    result loses color" behavior. See the BUGFIX note in this module's
-    docstring.
-    """
-    colors = np.full((len(pcd.points), 3), FALLBACK_GRAY, dtype=np.float64)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    return pcd
-
-
-def _concat_point_clouds(clouds: list) -> o3d.geometry.PointCloud:
-    """Merge point clouds via manual array concatenation.
-
-    BUGFIX: Open3D's `PointCloud.__add__`/`__iadd__` clears the ENTIRE
-    result's colors if either operand lacks a colors array (or the
-    arrays mismatch length). This function never touches `+`/`+=`, so
-    it's immune to that behavior. Every incoming cloud is guaranteed to
-    already carry a `.colors` array of matching length (either real
-    camera-projected color or `_fill_fallback_color`'s fallback), so the
-    `np.vstack` calls below are always safe.
-    """
-    non_empty = [c for c in clouds if len(c.points)]
-
-    if not non_empty:
-        return o3d.geometry.PointCloud()
-
-    points = np.vstack([np.asarray(c.points) for c in non_empty])
-    merged = o3d.geometry.PointCloud()
-    merged.points = o3d.utility.Vector3dVector(points)
-
-    if all(c.has_colors() for c in non_empty):
-        colors = np.vstack([np.asarray(c.colors) for c in non_empty])
-        merged.colors = o3d.utility.Vector3dVector(colors)
-    else:
-        # Should not happen once every frame is fallback-colored before
-        # reaching this function, but guard against it defensively
-        # rather than silently emitting an uncolored merged cloud.
-        merged = _fill_fallback_color(merged)
-
-    if all(c.has_normals() for c in non_empty) and non_empty:
-        normals = np.vstack([np.asarray(c.normals) for c in non_empty])
-        if len(normals) == len(points):
-            merged.normals = o3d.utility.Vector3dVector(normals)
-
-    return merged
-
-
 def _merge_colored_pcds(
     colored_pcds: list,
     voxel_size: float,
@@ -221,7 +152,7 @@ def _merge_colored_pcds(
 ) -> o3d.geometry.PointCloud:
     """Concatenate per-frame colored clouds, remove gray fill near real color,
     then voxel-downsample. Returns a single merged PointCloud."""
-    all_pts, all_cols, all_nors, all_gray = [], [], [], []
+    all_pts, all_cols, all_nors = [], [], []
 
     for pcd in colored_pcds:
         if len(pcd.points) == 0 or not pcd.has_colors():
@@ -233,12 +164,9 @@ def _merge_colored_pcds(
             if pcd.has_normals()
             else np.zeros((len(pts), 3), dtype=np.float64)
         )
-
-        std = np.std(cols, axis=1)
-        mean = np.mean(cols, axis=1)
-        is_gray = (std < 0.08) & (np.abs(mean - 0.5) < 0.15)
-        all_pts.append(pts); all_cols.append(cols)
-        all_nors.append(nors); all_gray.append(is_gray)
+        all_pts.append(pts)
+        all_cols.append(cols)
+        all_nors.append(nors)
 
     if not all_pts:
         raise ValueError("No valid colored point clouds to merge.")
@@ -246,20 +174,18 @@ def _merge_colored_pcds(
     pts = np.vstack(all_pts)
     cols = np.vstack(all_cols)
     nors = np.vstack(all_nors)
-    is_gray = np.hstack(all_gray)
 
-    colored_pts = pts[~is_gray]
-    if len(colored_pts) > 0 and gray_filter_radius > 0:
-        print(f"  Gray-fill filtering (radius={gray_filter_radius} m)...")
-        tree = cKDTree(colored_pts)
-        gray_idx = np.where(is_gray)[0]
-        nbrs = tree.query_ball_point(pts[gray_idx], r=gray_filter_radius)
-        has_col = np.array([len(n) > 0 for n in nbrs], dtype=bool)
-        keep = np.ones(len(pts), dtype=bool)
-        keep[gray_idx[has_col]] = False
-        pts = pts[keep]; cols = cols[keep]; nors = nors[keep]
-    elif len(colored_pts) == 0:
-        print("  Warning: no colored points found; keeping all gray fills.")
+    if gray_filter_radius > 0:
+        gray = is_gray_fill(cols)
+        if not gray.any():
+            pass
+        elif gray.all():
+            print("  Warning: no colored points found; keeping all gray fills.")
+        else:
+            print(f"  Gray-fill filtering (radius={gray_filter_radius} m)...")
+            pts, cols, nors = remove_gray_fill_near_color(
+                pts, cols, gray_filter_radius, (nors,)
+            )
 
     merged = o3d.geometry.PointCloud()
     merged.points = o3d.utility.Vector3dVector(pts)
@@ -300,6 +226,9 @@ def run(args) -> None:
             "this bag's point cloud really is already in a fixed frame."
         )
 
+    lod_level_names = [name for name, _ in DEFAULT_LOD_LEVELS]
+    lod_levels = _build_lod_levels(lod_level_names, args.lod_multipliers)
+
     required = [args.pc_topic, args.gps_topic]
     if args.odom_topic:
         required.append(args.odom_topic)
@@ -309,7 +238,7 @@ def run(args) -> None:
     if missing:
         sys.exit(
             f"Error: Required topics missing from bag: {missing}\n"
-            "Check topic names with: ros2 bag info <bag_path>"
+            "Check topic names with: ros2 bag info "
         )
 
     # -- GPS origin ----------------------------------------------------
@@ -403,11 +332,11 @@ def run(args) -> None:
     # -- Merge + color projection -------------------------------------------
     # BUGFIX: every frame that reaches this merge -- whether it gets a real
     # camera projection or not -- is now guaranteed an explicit colors
-    # array (`_fill_fallback_color` for the ones that don't project), and
-    # the final combine uses `_concat_point_clouds` (manual numpy
-    # concatenation) instead of Open3D's `+`/`+=`, which would otherwise
-    # silently strip color from the entire result whenever an uncolored
-    # frame was mixed with a colored one. See this module's docstring.
+    # array (`fill_fallback_color` for the ones that don't project), and
+    # the final combine uses `concat_point_clouds` (manual numpy
+    # concatenation, shared with color_mesh.py) instead of Open3D's
+    # `+`/`+=`, which would otherwise silently strip color from the entire
+    # result whenever an uncolored frame was mixed with a colored one.
     print(f"\n[4/7] Merging registered frames{' with color projection' if color_mode else ''}...")
     uncolored_frames: list[o3d.geometry.PointCloud] = []
     colored_frames: list[o3d.geometry.PointCloud] = []
@@ -440,7 +369,7 @@ def run(args) -> None:
                     )
                     if interpolated is not None:
                         cam_pose = interpolated
-                pcd_world = _color_pcd_from_image(
+                pcd_world = color_pcd_from_image(
                     pcd_world, camera_images[cam_ts], cam_pose,
                     intrinsics, args.color_min_depth, args.color_max_depth,
                 )
@@ -451,8 +380,8 @@ def run(args) -> None:
         if not colored_this_frame:
             # BUGFIX (root cause 1): explicitly fallback-color this frame
             # instead of letting it enter the merge with no colors array
-            # at all -- see the BUGFIX note in this module's docstring.
-            pcd_world = _fill_fallback_color(pcd_world)
+            # at all.
+            pcd_world = fill_fallback_color(pcd_world)
             uncolored_frames.append(pcd_world)
             fallback_gray_count += 1
 
@@ -478,52 +407,52 @@ def run(args) -> None:
     # BUGFIX (root cause 2): combine via manual concatenation, never `+=`,
     # so a mix of colored and fallback-gray pieces can never silently
     # strip color from the whole result.
-    pcd_combined = _concat_point_clouds(merged_pieces)
+    pcd_combined = concat_point_clouds(merged_pieces)
 
     print(f"  Merge: {merged_frame_count:,} frame(s) actually merged into the combined cloud.")
     del selected_frames, pose_by_timestamp
 
     # -- Clean -------------------------------------------------------------
     print("\n[5/7] Cleaning merged cloud...")
-    pcd_clean = clean_point_cloud(
-        pcd_combined, args.voxel_size, do_voxel_downsample=False
-    )
+    pcd_clean = clean_point_cloud(pcd_combined, args.voxel_size, do_voxel_downsample=False)
     if len(pcd_clean.points) == 0:
         sys.exit("Error: No points remain after cleaning.")
     print(f"  Final cloud: {len(pcd_clean.points):,} points")
 
-    # -- Georeference + export ---------------------------------------------
+    # -- Georeference + export (3 LOD layers) -------------------------------
     print("\n[6/7] Georeferencing (local ENU -> ECEF)...")
-    print("\n[7/7] Writing 3D Tiles...")
-    tiles_dir, _ = georeference_and_export_tileset(
-        pcd_clean, lat0, lon0, alt0, out_dir, bag_path.stem, args.workers
+    print("\n[7/7] Writing 3D Tiles LOD layers...")
+    tiles_dirs, _ = georeference_and_export_lod_tilesets(
+        pcd_clean, lat0, lon0, alt0, out_dir, bag_path.stem, args.workers,
+        base_voxel_size=args.voxel_size, lod_levels=lod_levels,
     )
 
-    print(f"\nColored 3D Tiles written to: {tiles_dir}")
+    print("\nColored 3D Tiles LOD layers written:")
+    for name, tiles_dir in tiles_dirs.items():
+        print(f"  {name}: {tiles_dir}")
     print("Done.")
 
 
 def build_parser(sub):
     p = sub.add_parser(
         "color_tiles_3d",
-        help="ROS 2 bag -> colored georeferenced point cloud -> Cesium 3D Tiles"
+        help="ROS 2 bag -> colored georeferenced point cloud -> Cesium 3D Tiles (3 LOD layers)"
     )
-
     p.add_argument("bagpath", help="Path to the ROS 2 bag directory.")
     p.add_argument("outputdir", help="Output directory.")
 
     # Topics
     p.add_argument("--pc_topic", default="points")
     p.add_argument("--odom_topic", default=None,
-        help=(
-            "Odometry topic. Required unless the point cloud is already "
-            "published in a global/fixed frame (see --pc_frame_mode)."
-        ))
+                    help=(
+                        "Odometry topic. Required unless the point cloud is already "
+                        "published in a global/fixed frame (see --pc_frame_mode)."
+                    ))
     p.add_argument("--gps_topic", default="/gps/fix")
     p.add_argument("--camera_topic", default=None,
-        help="sensor_msgs/Image or CompressedImage topic. Optional.")
+                    help="sensor_msgs/Image or CompressedImage topic. Optional.")
     p.add_argument("--camera_info_topic", default=None,
-        help="sensor_msgs/CameraInfo topic. Required with --camera_topic.")
+                    help="sensor_msgs/CameraInfo topic. Required with --camera_topic.")
     p.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -539,12 +468,12 @@ def build_parser(sub):
 
     # Color
     p.add_argument("--max_time_diff", type=float, default=0.1,
-        help="Max timestamp diff (s) between PC frame and camera image.")
+                    help="Max timestamp diff (s) between PC frame and camera image.")
     p.add_argument("--color_min_depth", type=float, default=0.1)
     p.add_argument("--color_max_depth", type=float, default=None)
     p.add_argument("--gray_filter_radius", type=float, default=0.05,
-        help="Gray-fill points with a real-color neighbor within this "
-             "radius (m) are removed. 0 = disable.")
+                    help="Gray-fill points with a real-color neighbor within this "
+                         "radius (m) are removed. 0 = disable.")
 
     # Registration
     p.add_argument("--voxel_size", type=float, default=0.05)
@@ -585,11 +514,26 @@ def build_parser(sub):
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
     p.add_argument("--frame_stride", type=int, default=1,
-        help="Process every Nth frame.")
+                    help="Process every Nth frame.")
     p.add_argument("--max_registration_frames", type=int, default=0,
-        help="Cap total frames used for registration (0 = all).")
+                    help="Cap total frames used for registration (0 = all).")
     p.add_argument("--merge_chunk_frames", type=int, default=16,
-        help="Number of frames per merge chunk (reserved for future streaming use).")
+                    help="Number of frames per merge chunk (reserved for future streaming use).")
+
+    # LOD / multi-layer output
+    p.add_argument(
+        "--lod_multipliers", type=str, default="4.0,2.0,1.0",
+        help=(
+            "Comma-separated voxel-size multipliers (relative to --voxel_size) "
+            "for the three output LOD layers, in "
+            f"{'/'.join(name for name, _ in DEFAULT_LOD_LEVELS)} order "
+            "(default: 4.0,2.0,1.0). Each layer is voxel-downsampled at "
+            "voxel_size * multiplier and written to its own "
+            "outputdir/tileset_<name>/ folder; a multiplier of 1.0 uses the "
+            "cloud's own (already-cleaned) resolution with no extra "
+            "downsampling."
+        ),
+    )
 
     # Performance
     p.add_argument("--workers", type=int, default=4)

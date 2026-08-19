@@ -24,12 +24,26 @@ global/fixed-frame point cloud get a correct no-op transform while still
 getting sensor-origin-derived view rays for normal orientation, which is
 exactly the global-frame behaviour described in
 pointcloud-frame-check-prompt-2.md.
+
+FEATURE NOTE (multi-LOD tileset export):
+Both pipelines previously called `georeference_and_export_tileset()` once
+and produced a single `tileset/` directory (one resolution, i.e. one
+"layer"). `georeference_and_export_lod_tilesets()` below generalizes this
+to export the same cleaned/merged cloud multiple times at different voxel
+densities (coarse/medium/fine by default), each into its own
+`tileset_<name>/` subfolder, so a Cesium viewer (or any 3D Tiles client)
+can offer the user a quality/performance toggle between layers. The
+original single-tileset ECEF/PLY/py3dtiles-convert tail end is factored
+out into `_export_pcd_as_tileset()` so both the legacy single-tileset path
+and the new multi-LOD path share one implementation -- consistent with
+this module's own refactor rationale above.
 """
 
 from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -42,7 +56,6 @@ from tqdm import tqdm
 from .reconstruction import transform_local_enu_to_ecef
 from .registration import attach_view_rays_as_normals
 from .ros_io import TYPESTORE, interpolate_odom_pose
-
 
 # ---------------------------------------------------------------------------
 # Generic bag reading
@@ -208,6 +221,43 @@ def write_colored_ply_ecef(
 # ---------------------------------------------------------------------------
 # Shared georeference + py3dtiles export tail
 # ---------------------------------------------------------------------------
+def _export_pcd_as_tileset(
+    pcd: o3d.geometry.PointCloud,
+    lat0: float,
+    lon0: float,
+    alt0: float,
+    tiles_dir: Path,
+    workers: int,
+) -> None:
+    """
+    Convert one already-finalized world-frame cloud to ECEF, write it as a
+    (optionally colored) temp PLY, and run py3dtiles convert into
+    `tiles_dir`.
+
+    This is the single-tileset ECEF/PLY/py3dtiles-convert tail end, shared
+    by both the legacy `georeference_and_export_tileset()` single-layer
+    path and the multi-LOD `georeference_and_export_lod_tilesets()` path
+    below, so a future fix only needs to be made once.
+    """
+    pts_enu = np.asarray(pcd.points, dtype=np.float64)
+    pts_ecef = transform_local_enu_to_ecef(pts_enu, lat0, lon0, alt0)
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+        ply_path = Path(tmp.name)
+
+    try:
+        if pcd.has_colors():
+            colors = np.asarray(pcd.colors, dtype=np.float64)
+            write_colored_ply_ecef(pts_ecef, colors, ply_path)
+        else:
+            write_ply_ecef(pts_ecef, ply_path)
+
+        tiles_dir.mkdir(parents=True, exist_ok=True)
+        run_py3dtiles_convert(ply_path, tiles_dir, jobs=workers)
+    finally:
+        ply_path.unlink(missing_ok=True)
+
+
 def georeference_and_export_tileset(
     pcd_clean: o3d.geometry.PointCloud,
     lat0: float,
@@ -222,34 +272,85 @@ def georeference_and_export_tileset(
     (optionally colored) PLY, run py3dtiles convert, and save the ENU-frame
     cloud for reference.
 
-    This is the exact tail-end logic (steps 6-9 in the module docstrings of
-    both pipelines) that was previously duplicated verbatim in tiles_3d.py
-    and color_tiles_3d.py. Returns (tiles_dir, enu_ply_path).
+    Legacy single-tileset entry point, kept for any other caller that only
+    wants one output layer. `tiles_3d.py` and `color_tiles_3d.py` now call
+    `georeference_and_export_lod_tilesets()` instead to get three LOD
+    layers. Returns (tiles_dir, enu_ply_path).
     """
-    import tempfile
-
-    pts_enu = np.asarray(pcd_clean.points, dtype=np.float64)
-    pts_ecef = transform_local_enu_to_ecef(pts_enu, lat0, lon0, alt0)
-
-    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
-        ply_path = Path(tmp.name)
-
-    has_colors = pcd_clean.has_colors()
-    if has_colors:
-        colors = np.asarray(pcd_clean.colors, dtype=np.float64)
-        write_colored_ply_ecef(pts_ecef, colors, ply_path)
-    else:
-        write_ply_ecef(pts_ecef, ply_path)
-
     tiles_dir = out_dir / "tileset"
-    tiles_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        run_py3dtiles_convert(ply_path, tiles_dir, jobs=workers)
-    finally:
-        ply_path.unlink(missing_ok=True)
+    _export_pcd_as_tileset(pcd_clean, lat0, lon0, alt0, tiles_dir, workers)
 
     enu_ply = out_dir / f"{bag_stem}_cloud_enu.ply"
     o3d.io.write_point_cloud(str(enu_ply), pcd_clean)
     print(f"  ENU cloud: {enu_ply}")
 
     return tiles_dir, enu_ply
+
+
+# Default LOD ladder: (name, voxel-size multiplier relative to the
+# pipeline's own `--voxel_size`). "fine" uses a multiplier of 1.0, i.e. the
+# cloud's own resolution as already produced by upstream merging/cleaning
+# -- no extra downsampling -- so the fine layer is identical to what the
+# single-tileset path used to produce.
+DEFAULT_LOD_LEVELS: tuple[tuple[str, float], ...] = (
+    ("coarse", 4.0),
+    ("medium", 2.0),
+    ("fine", 1.0),
+)
+
+
+def georeference_and_export_lod_tilesets(
+    pcd_clean: o3d.geometry.PointCloud,
+    lat0: float,
+    lon0: float,
+    alt0: float,
+    out_dir: Path,
+    bag_stem: str,
+    workers: int,
+    base_voxel_size: float,
+    lod_levels: tuple[tuple[str, float], ...] = DEFAULT_LOD_LEVELS,
+) -> tuple[dict[str, Path], Path]:
+    """
+    Export `pcd_clean` as multiple LOD (level-of-detail) 3D Tiles tilesets
+    -- coarse/medium/fine by default -- instead of a single tileset, so a
+    viewer can switch between quality levels.
+
+    Each entry in `lod_levels` is a `(name, voxel_multiplier)` pair. The
+    cloud for a given level is `pcd_clean` voxel-downsampled at
+    `base_voxel_size * voxel_multiplier`. A multiplier of `1.0` (the
+    "fine" default) reuses `pcd_clean` as-is with no extra downsampling,
+    since it is already at `base_voxel_size` resolution from upstream
+    merging/cleaning. Each level is written into its own
+    `out_dir/tileset_<name>/` subfolder via `_export_pcd_as_tileset()`.
+
+    Returns `({level_name: tiles_dir}, enu_ply_path)`. The ENU-frame
+    reference PLY is written once, at full (base) resolution, not once per
+    level.
+    """
+    tiles_dirs: dict[str, Path] = {}
+
+    for name, multiplier in lod_levels:
+        if multiplier > 1.0:
+            lod_voxel = base_voxel_size * multiplier
+            pcd_lod = pcd_clean.voxel_down_sample(lod_voxel)
+        else:
+            lod_voxel = base_voxel_size
+            pcd_lod = pcd_clean
+
+        print(
+            f"  [LOD:{name}] voxel={lod_voxel:.3f} m -> "
+            f"{len(pcd_lod.points):,} points"
+        )
+
+        tiles_dir = out_dir / f"tileset_{name}"
+        _export_pcd_as_tileset(pcd_lod, lat0, lon0, alt0, tiles_dir, workers)
+        tiles_dirs[name] = tiles_dir
+
+        if pcd_lod is not pcd_clean:
+            del pcd_lod
+
+    enu_ply = out_dir / f"{bag_stem}_cloud_enu.ply"
+    o3d.io.write_point_cloud(str(enu_ply), pcd_clean)
+    print(f"  ENU cloud (full resolution): {enu_ply}")
+
+    return tiles_dirs, enu_ply

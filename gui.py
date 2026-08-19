@@ -45,13 +45,46 @@ the camera-*projection*-coloring pipelines `color_mesh`/`color_tiles_3d`:
 per-point camera-projection step at all (it bakes a UV atlas from
 keyframe view assignment instead), and no isotropic-remesh CLI flag
 either. Sending them produced:
-    unrecognized arguments: --max_time_diff ... --remesh ...
+  unrecognized arguments: --max_time_diff ... --remesh ...
 and the pipeline exited with code 2 before doing any work. Fixed by
 replacing the profile's param list with one that matches
 `texture_baking.py`'s argparse exactly: `camera_topic`/`camera_info_topic`
 (required, but with no projection-specific fields), plus the two flags
 that pipeline DOES accept but the GUI was missing entirely --
 `--min_frame_points` and `--overwrite`.
+
+PATCH NOTE (Color Mesh remeshing option removed):
+`color_mesh.py` no longer accepts `--remesh`/`--remesh_smooth_iterations`
+at all -- isotropic remeshing rebuilds the mesh from bare vertex/face
+matrices with no color channel, so it silently destroyed every per-vertex
+camera color that pipeline exists to produce (see color_mesh.py's own
+PATCH NOTE). `_COMMON_RECONSTRUCTION` has been split into a base group
+(no remesh) plus a separate `_REMESH_OPTIONS` group. The "Mesh" profile
+(plain, uncolored mesh, where remeshing is safe -- its optional height
+false-color pass runs as a *separate* post-process on the already-
+remeshed output file) still includes `_REMESH_OPTIONS`. The "Color Mesh"
+profile no longer does, so the GUI can never send `--remesh` /
+`--remesh_smooth_iterations` to a pipeline that would reject them as
+unrecognized arguments. "Color Tiles" (`color_tiles_3d`) never had a mesh
+step or a remesh flag in the first place -- it was never affected.
+
+PATCH NOTE (sidebar pipeline order):
+The `PROFILES` dict's insertion order drives the sidebar button order
+(see `_build_layout`'s `for profile_name in PROFILES:` loop) and the
+"first profile selected on launch" default (`list(PROFILES.keys())[0]`
+in `BellhopGUI.__init__`). Reordered to: OG Map, Mesh, 3D Tiles, Gazebo
+World, Color Mesh, Color Tiles, Texture Baking. This is purely a display/
+default-selection change -- no profile's `params`, `pipeline` name, or
+`required_topics_fields` were altered.
+
+PATCH NOTE (ATAK references removed from Texture Baking):
+`texture_baking.py` no longer packages its output into an ATAK-compatible
+zip -- it now stops after writing the baked OBJ + PNG texture (see that
+module's own PATCH NOTE). The "Texture Baking" profile's description
+string here previously said "Keyframe-baked textured mesh (ATAK zip)";
+updated to "...(OBJ + texture)" to match. No `params` changed -- this
+profile never had an ATAK-specific field to begin with (packaging was
+unconditional in the old pipeline, not a flag).
 """
 
 from __future__ import annotations
@@ -127,6 +160,10 @@ _PC_FRAME_MODE = [
     ),
 ]
 
+# PATCH: split out of the old _COMMON_RECONSTRUCTION -- these fields are
+# safe for both the plain "Mesh" pipeline and the colored "Color Mesh"
+# pipeline. Remeshing is intentionally NOT in this group anymore; see
+# _REMESH_OPTIONS below and the PATCH NOTE at the top of this file.
 _COMMON_RECONSTRUCTION = [
     (
         "poisson_depth",
@@ -138,14 +175,6 @@ _COMMON_RECONSTRUCTION = [
     ("min_density_percentile", "Min density percentile", "entry", "1.0", {}),
     ("distance_multiplier", "Distance trim multiplier", "entry", "3.0", {}),
     ("max_vertex_distance", "Distance trim hard cap (m)", "entry", "", {}),
-    ("remesh", "Remesh + smooth", "check", True, {}),
-    (
-        "remesh_smooth_iterations",
-        "Remesh smooth iterations",
-        "spinbox",
-        "5",
-        {"from_": 0, "to": 50},
-    ),
     ("decimate_target", "Decimate target (ratio/>1)", "entry", "", {}),
     ("curvature_percentile", "Protect curvature percentile", "entry", "80.0", {}),
     (
@@ -156,6 +185,24 @@ _COMMON_RECONSTRUCTION = [
         {"from_": 0, "to": 5},
     ),
     ("level_floor", "Level floor", "check", False, {}),
+]
+
+# PATCH: isotropic remeshing (reconstruction.remesh_isotropic) rebuilds
+# the mesh from bare vertex/face matrices with no color channel, so it
+# silently destroys per-vertex color. Only pipelines whose mesh has no
+# per-vertex color baked in before this step -- i.e. only "Mesh" -- may
+# include this group. `color_mesh.py` no longer has a `--remesh` /
+# `--remesh_smooth_iterations` CLI flag at all, so "Color Mesh" MUST NOT
+# include this group, or the GUI would send unrecognized arguments.
+_REMESH_OPTIONS = [
+    ("remesh", "Remesh + smooth", "check", True, {}),
+    (
+        "remesh_smooth_iterations",
+        "Remesh smooth iterations",
+        "spinbox",
+        "5",
+        {"from_": 0, "to": 50},
+    ),
 ]
 
 # PATCH: height false-color export is now baked as per-vertex PLY colors
@@ -212,6 +259,11 @@ _OCTREE_PERF = [
 
 # ---------------------------------------------------------------------------
 # Pipeline profiles
+#
+# PATCH: insertion order here drives both the sidebar button order and
+# the default-selected profile on launch (see PATCH NOTE at the top of
+# this file). Order: OG Map, Mesh, 3D Tiles, Gazebo World, Color Mesh,
+# Color Tiles, Texture Baking.
 # ---------------------------------------------------------------------------
 PROFILES = {
     "OG Map": {
@@ -220,20 +272,8 @@ PROFILES = {
         "required_topics_fields": ["pc_topic", "odom_topic"],
         "params": (
             [
-                (
-                    "pc_topic",
-                    "PointCloud2 topic",
-                    "entry",
-                    "/points",
-                    {},
-                ),
-                (
-                    "odom_topic",
-                    "Odometry topic",
-                    "entry",
-                    "/odom",
-                    {},
-                ),
+                ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
+                ("odom_topic", "Odometry topic", "entry", "/odom", {}),
             ]
             + _PC_FRAME_MODE
             + [
@@ -292,7 +332,50 @@ PROFILES = {
             + _PC_FRAME_MODE
             + _COMMON_REGISTRATION
             + _COMMON_RECONSTRUCTION
+            + _REMESH_OPTIONS
             + _HEIGHT_FALSE_COLOR
+        ),
+    },
+    "3D Tiles": {
+        "pipeline": "tiles_3d",
+        "description": "Georeferenced Cesium 3D Tiles -> tileset.json",
+        "required_topics_fields": ["pc_topic", "gps_topic"],
+        "params": (
+            _COMMON_TOPICS + _PC_FRAME_MODE + _GPS_TOPIC + _COMMON_REGISTRATION
+        ),
+    },
+    "Gazebo World": {
+        "pipeline": "gazebo_world",
+        "description": "Gazebo simulation world -> .stl + .sdf + .world",
+        "required_topics_fields": ["pc_topic"],
+        "params": (
+            [
+                ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
+                ("odom_topic", "Odometry topic", "entry", "", {}),
+            ]
+            + _PC_FRAME_MODE
+            + [
+                ("model_name", "Model name", "entry", "bag_environment", {}),
+                (
+                    "gazebo_material",
+                    "Gazebo material",
+                    "combobox",
+                    "Gazebo/Grey",
+                    {
+                        "values": [
+                            "Gazebo/Grey",
+                            "Gazebo/White",
+                            "Gazebo/Wood",
+                            "Gazebo/Black",
+                            "Gazebo/Green",
+                        ]
+                    },
+                ),
+            ]
+            # level_floor removed here -- already provided by _COMMON_RECONSTRUCTION
+            + _COMMON_REGISTRATION
+            + _COMMON_RECONSTRUCTION
+            + _REMESH_OPTIONS
         ),
     },
     "Color Mesh": {
@@ -303,6 +386,11 @@ PROFILES = {
             "camera_topic",
             "camera_info_topic",
         ],
+        # PATCH: no _REMESH_OPTIONS here -- color_mesh.py has no
+        # --remesh/--remesh_smooth_iterations CLI flag at all anymore
+        # (isotropic remeshing destroyed the per-vertex camera color this
+        # pipeline exists to produce). See the PATCH NOTE at the top of
+        # this file.
         "params": (
             _COMMON_TOPICS
             + _PC_FRAME_MODE
@@ -311,9 +399,28 @@ PROFILES = {
             + _COMMON_RECONSTRUCTION
         ),
     },
+    "Color Tiles": {
+        "pipeline": "color_tiles_3d",
+        "description": "Coloured georeferenced Cesium 3D Tiles -> tileset.json",
+        "required_topics_fields": ["pc_topic", "gps_topic"],
+        # No remesh group here, and never was -- color_tiles_3d.py
+        # produces a colored point cloud, not a mesh, so it has no
+        # reconstruction/remesh step or CLI flag at all.
+        "params": (
+            _COMMON_TOPICS
+            + _PC_FRAME_MODE
+            + _GPS_TOPIC
+            + _COMMON_COLOR
+            + _COMMON_REGISTRATION
+        ),
+    },
     "Texture Baking": {
         "pipeline": "texture_baking",
-        "description": "Keyframe-baked textured mesh (ATAK zip)",
+        # PATCH: was "Keyframe-baked textured mesh (ATAK zip)" -- the
+        # pipeline no longer produces an ATAK zip at all; it now stops
+        # after writing the baked OBJ + PNG texture. See texture_baking.py's
+        # own PATCH NOTE.
+        "description": "Keyframe-baked textured mesh (OBJ + texture)",
         "required_topics_fields": [
             "pc_topic",
             "camera_topic",
@@ -425,59 +532,6 @@ PROFILES = {
                 ),
                 ("overwrite", "Overwrite existing output workspace", "check", True, {}),
             ]
-        ),
-    },
-    "Gazebo World": {
-        "pipeline": "gazebo_world",
-        "description": "Gazebo simulation world -> .stl + .sdf + .world",
-        "required_topics_fields": ["pc_topic"],
-        "params": (
-            [
-                ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
-                ("odom_topic", "Odometry topic", "entry", "", {}),
-            ]
-            + _PC_FRAME_MODE
-            + [
-                ("model_name", "Model name", "entry", "bag_environment", {}),
-                (
-                    "gazebo_material",
-                    "Gazebo material",
-                    "combobox",
-                    "Gazebo/Grey",
-                    {
-                        "values": [
-                            "Gazebo/Grey",
-                            "Gazebo/White",
-                            "Gazebo/Wood",
-                            "Gazebo/Black",
-                            "Gazebo/Green",
-                        ]
-                    },
-                ),
-                # level_floor removed here -- already provided by _COMMON_RECONSTRUCTION
-            ]
-            + _COMMON_REGISTRATION
-            + _COMMON_RECONSTRUCTION
-        ),
-    },
-    "3D Tiles": {
-        "pipeline": "tiles_3d",
-        "description": "Georeferenced Cesium 3D Tiles -> tileset.json",
-        "required_topics_fields": ["pc_topic", "gps_topic"],
-        "params": (
-            _COMMON_TOPICS + _PC_FRAME_MODE + _GPS_TOPIC + _COMMON_REGISTRATION
-        ),
-    },
-    "Color Tiles": {
-        "pipeline": "color_tiles_3d",
-        "description": "Coloured georeferenced Cesium 3D Tiles -> tileset.json",
-        "required_topics_fields": ["pc_topic", "gps_topic"],
-        "params": (
-            _COMMON_TOPICS
-            + _PC_FRAME_MODE
-            + _GPS_TOPIC
-            + _COMMON_COLOR
-            + _COMMON_REGISTRATION
         ),
     },
 }
@@ -641,7 +695,6 @@ class BellhopGUI:
             window=self.form_frame,
             anchor="nw",
         )
-
         self.form_frame.bind("<Configure>", self._on_form_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
@@ -819,7 +872,6 @@ class BellhopGUI:
             padx=16,
             pady=(12, 2),
         )
-
         tk.Label(
             frame,
             text=text.upper(),
@@ -916,7 +968,6 @@ class BellhopGUI:
 
         if widget_type == "check":
             variable = tk.BooleanVar(value=bool(default))
-
             tk.Checkbutton(
                 self.form_frame,
                 variable=variable,
@@ -926,7 +977,6 @@ class BellhopGUI:
 
         elif widget_type == "spinbox":
             variable = tk.StringVar(value=str(default))
-
             tk.Spinbox(
                 self.form_frame,
                 textvariable=variable,
@@ -940,7 +990,6 @@ class BellhopGUI:
 
         elif widget_type == "combobox":
             variable = tk.StringVar(value=str(default))
-
             ttk.Combobox(
                 self.form_frame,
                 textvariable=variable,
@@ -954,7 +1003,6 @@ class BellhopGUI:
             variable = tk.StringVar(
                 value=str(default) if default is not None else ""
             )
-
             tk.Entry(
                 self.form_frame,
                 textvariable=variable,
@@ -1164,7 +1212,7 @@ class BellhopGUI:
 
             value = str(value).strip()
 
-            # Omit Auto so reconstruction selects adaptive depth.
+            # Omit "Auto" so reconstruction selects adaptive depth.
             if argument == "poisson_depth" and value.lower() == "auto":
                 continue
 
@@ -1263,7 +1311,6 @@ class BellhopGUI:
                         state="normal",
                         text="\u25b6 Run Pipeline",
                     )
-
         except queue.Empty:
             pass
 
@@ -1373,7 +1420,6 @@ class BellhopGUI:
             bg=colors["surface"],
             fg=colors["primary"],
         )
-
         self.theme_button.configure(
             bg=colors["surface"],
             fg=colors["text_muted"],

@@ -11,18 +11,43 @@ to run against a raw, non-deskewed sensor-frame cloud.
 The point cloud's frame_id is now detected (or overridden via
 --pc_frame_mode) and classified as 'global' (odom/map/world) or 'local'
 (a moving sensor/base frame):
-  - 'global' (default-detected): unchanged behaviour -- points are used
-    as-is for frustum-visibility filtering, Poisson reconstruction, and
-    normal orientation.
-  - 'local': each frame's points are transformed into the world frame
-    using an odometry-derived pose (interpolated from the trajectory CSV,
-    linear translation + SLERP rotation, not nearest-neighbor snapping)
-    before those same steps. Odometry is already this pipeline's sole
-    pose source (no ICP/registration exists or is needed here).
-CAVEAT: this only corrects for the odom-reported fixed-frame-to-base
-transform. It does NOT correct for a real sensor-to-base_link extrinsic
-offset (lever arm); that requires a separate static transform (e.g. from
-tf_static), which is out of scope here.
+- 'global' (default-detected): unchanged behaviour -- points are used
+  as-is for frustum-visibility filtering, Poisson reconstruction, and
+  normal orientation.
+- 'local': each frame's points are transformed into the world frame
+  using an odometry-derived pose (interpolated from the trajectory CSV,
+  linear translation + SLERP rotation, not nearest-neighbor snapping)
+  before those same steps. Odometry is already this pipeline's sole
+  pose source (no ICP/registration exists or is needed here).
+  CAVEAT: this only corrects for the odom-reported fixed-frame-to-base
+  transform. It does NOT correct for a real sensor-to-base_link extrinsic
+  offset (lever arm); that requires a separate static transform (e.g. from
+  tf_static), which is out of scope here.
+
+REFACTOR NOTE (atlas_pipeline/common moved into shared):
+This pipeline's helper package, `atlas_pipeline/`, used to keep its own
+`common/` subpackage (`trajectory.py`, `projection.py`, `packaging.py`)
+separate from the pipeline-wide `shared/` package two directories up.
+That split had no real justification -- none of those three modules are
+atlas-bake-specific -- so their contents now live directly in `shared/`
+alongside `shared/ros_io.py`, `shared/reconstruction.py`, etc.
+`atlas_pipeline/common/` no longer exists; every module in
+`atlas_pipeline/` (and this file) now imports `load_trajectory`,
+`build_trajectory_tree`, and `setup_workspace` from `.shared` instead of
+`.atlas_pipeline.common`.
+
+PATCH NOTE (ATAK export removed -- pipeline now stops at the OBJ):
+This pipeline previously finished by packaging the baked OBJ + MTL + PNG
+into an ATAK-compatible zip via `create_atak_zip()`. That step (and the
+`create_atak_zip()` function itself, along with its `zipfile` dependency)
+has been removed entirely. The pipeline's final output is now the baked
+OBJ mesh (`{stem}_baked_mesh.obj`) and its PNG texture
+(`{stem}_baked_mesh_texture.png`), written directly into the workspace
+directory -- no zip, no ATAK-specific MTL injection, no georef sidecar
+packaging. `shared/packaging.py`'s `setup_workspace()` no longer reserves
+ATAK-only output filenames in its returned path dict (see that module's
+docstring); this file never actually read those particular keys anyway,
+so removing them changes nothing else.
 """
 
 from __future__ import annotations
@@ -34,9 +59,9 @@ from scipy.spatial.transform import Rotation as R
 
 from .shared.preflight import check_topics
 from .shared.ros_io import TYPESTORE, get_odom_transform, intrinsics_from_camera_info, resolve_pc_frame_mode
+from .shared.packaging import setup_workspace
+from .shared.trajectory import load_trajectory, build_trajectory_tree
 
-from .atlas_pipeline.common.packaging import create_atak_zip, setup_workspace
-from .atlas_pipeline.common.trajectory import load_trajectory, build_trajectory_tree
 from .atlas_pipeline.keyframeselector import KeyframeSelector
 from .atlas_pipeline.meshgenerator import MeshGenerator
 from .atlas_pipeline.pointcloudutils import PointCloudProcessor
@@ -194,20 +219,17 @@ def run(args: argparse.Namespace) -> None:
     )
     baker.bake_texture(final_mesh_obj, final_texture_png)
 
-    print("Packaging ATAK zip...")
-    final_zip = create_atak_zip(final_mesh_obj, paths["final_zip"], png_path=final_texture_png)
-
     print(f"Saved baked mesh: {final_mesh_obj}")
     print(f"Saved baked texture: {final_texture_png}")
-    print(f"Saved ATAK zip: {final_zip}")
     print("Done.")
 
 
 def build_parser(sub):
     parser = sub.add_parser(
         "texture_baking",
-        help="ROS 2 bag -> keyframe-baked textured mesh (atlas UV pipeline)",
+        help="ROS 2 bag -> keyframe-baked textured mesh (OBJ + PNG texture)",
     )
+
     parser.add_argument("bagpath", help="Path to the ROS 2 bag.")
     parser.add_argument("outputdir", help="Output directory (workspace).")
 
@@ -231,6 +253,7 @@ def build_parser(sub):
             "sensor-frame point cloud."
         ),
     )
+
     parser.add_argument(
         "--odom_max_latency",
         type=float,

@@ -1,7 +1,14 @@
 """
 pipelines.atlas_pipeline.keyframeselector
-==============================================
+==========================================
 Keyframe selection for the atlas-bake pipeline.
+
+REFACTOR NOTE (moved from atlas_pipeline/common to shared):
+Previously imported `load_trajectory`/`parse_stem_timestamp` from
+`.common.trajectory` (i.e. `atlas_pipeline/common/trajectory.py`). That
+package has been merged into `shared/` (see `shared/trajectory.py`'s
+module docstring), so this now imports from `..shared.trajectory`
+instead. No behavior change.
 """
 
 import logging
@@ -12,7 +19,7 @@ import numpy as np
 from rosbags.highlevel import AnyReader
 from scipy.spatial.transform import Rotation as R
 
-from .common.trajectory import load_trajectory, parse_stem_timestamp
+from ..shared.trajectory import load_trajectory, parse_stem_timestamp
 from ..shared.ros_io import TYPESTORE, convert_ros_image, get_odom_transform
 
 
@@ -27,6 +34,7 @@ class KeyframeSelector:
             sorted(list(self.image_folder.glob("*.png")))
             + sorted(list(self.image_folder.glob("*.jpg")))
         )
+
         self.total_images = len(self.images)
         logging.info(f"Found {self.total_images} images")
 

@@ -1,7 +1,14 @@
 """
-colormesh3d.atlas_pipeline.meshgenerator
-===========================================
+pipelines.atlas_pipeline.meshgenerator
+=======================================
 Mesh generation, smoothing, and culling utilities for the atlas-bake pipeline.
+
+REFACTOR NOTE (moved from atlas_pipeline/common to shared):
+Previously imported trajectory/projection helpers from `.common.trajectory`
+and `.common.projection` (i.e. `atlas_pipeline/common/`). That package has
+been merged into `shared/` (see `shared/trajectory.py`'s module
+docstring), so this now imports from `..shared.trajectory` and
+`..shared.projection` instead. No behavior change.
 
 PATCH NOTE (isotropic remeshing before UV/atlas work):
 Added `remesh_isotropic()`, mirroring `shared/reconstruction.py`'s
@@ -19,23 +26,6 @@ sensitive to. Regularizing triangle topology here, after smoothing but
 before `cull_invisible_faces()` / view assignment / UV atlas packing,
 improves downstream bake quality without disturbing the existing
 Poisson -> smooth -> cull -> assign -> pack -> bake ordering.
-
-FIX (broken import): this module previously imported its trajectory/
-projection helpers from a top-level `colormesh3d.common` package that
-does not exist anywhere in this repository:
-
-    from colormesh3d.common.trajectory import ...
-    from colormesh3d.common.projection import ...
-
-This is leftover from a prior standalone project (literally named
-"colormesh3d") that this pipeline was merged in from; the actual package
-here is `pipelines.atlas_pipeline.common`. Since `meshgenerator.py` is
-imported directly by `texture_baking.py` at module load time, the bad
-absolute import raised `ModuleNotFoundError: No module named
-'colormesh3d'` immediately whenever the `texture_baking` pipeline was
-invoked -- before any pipeline logic ran. Switched to the same relative
-import pattern already used correctly by `keyframeselector.py` and
-`pointcloudutils.py` in this same package.
 
 BUGFIX (unguarded trimesh.repair.fix_normals crash):
 `cull_invisible_faces()` already wraps `trimesh.repair.fill_holes()` in a
@@ -65,8 +55,8 @@ import trimesh.repair
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from .common.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
-from .common.projection import world_to_optical, project_to_pixels
+from ..shared.trajectory import load_trajectory, build_trajectory_tree, get_pose_at
+from ..shared.projection import world_to_optical, project_to_pixels
 
 
 def _safe_fix_normals(mesh: trimesh.Trimesh, context: str) -> None:

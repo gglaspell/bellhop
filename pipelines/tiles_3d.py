@@ -11,7 +11,8 @@ Pipeline:
 5. Merge transformed frames into one world-frame cloud.
 6. Clean (voxel -> ROR -> SOR -> DBSCAN).
 7. Convert local ENU coords to ECEF (EPSG:4978).
-8. Write a temp .ply then call py3dtiles convert -> tileset.json output.
+8. Write a temp .ply per LOD level then call py3dtiles convert -> one
+   tileset_<name>/ directory per level (coarse/medium/fine by default).
 
 REFACTOR NOTE: Bag-reading, world-frame merge, and the ENU->ECEF->PLY->
 py3dtiles tail-end logic live in `shared/tiles_common.py` and are shared
@@ -60,6 +61,25 @@ now batched into a bounded list and flushed (concatenated +
 voxel-downsampled) every `--merge_chunk_frames` frames, so the flag now
 actually does what its help text describes instead of being reserved and
 unused.
+
+REFACTOR NOTE (shared chunked-merge helper):
+The chunked-merge helper ported from `mesh.py`/`gazebo_world.py` (above)
+was copy-pasted here as `_append_chunk()` -- byte-for-byte identical to
+`mesh.py`'s `append_chunk()` and `gazebo_world.py`'s own independently
+copy-pasted `_append_chunk()`. All three copies now live in one place,
+`shared/merge_utils.py` (`merge_chunk()`), imported from there instead of
+redefined locally, so a future fix to the chunking logic only needs to be
+made once.
+
+FEATURE NOTE (three LOD tileset layers):
+The final export step now calls
+`tiles_common.georeference_and_export_lod_tilesets()` instead of the
+single-layer `georeference_and_export_tileset()`. The same cleaned/merged
+cloud is voxel-downsampled at three densities (coarse/medium/fine by
+default, configurable via `--lod_multipliers`) and each density is written
+into its own `tileset_<name>/` subfolder under `outputdir`, so a Cesium
+viewer can offer a quality/performance toggle between layers instead of
+being stuck with one fixed-resolution tileset.
 """
 
 import gc
@@ -69,42 +89,33 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
+from .shared.merge_utils import merge_chunk
 from .shared.preflight import check_topics
 from .shared.reconstruction import clean_point_cloud
 from .shared.registration import run_odom_anchored_registration, select_registration_frames
 from .shared.ros_io import convert_ros_pc2_to_o3d, get_odom_transform, parse_gps_fixes, resolve_pc_frame_mode
 from .shared.tiles_common import (
-    georeference_and_export_tileset,
+    DEFAULT_LOD_LEVELS,
+    georeference_and_export_lod_tilesets,
     read_bag_topics,
     transform_frame_to_world,
 )
 
 
 # ---------------------------------------------------------------------------
-# PERF FIX: bounded, chunked merge helper (ported from mesh.py's
-# append_chunk() / gazebo_world.py's _append_chunk()). Frames accumulate in
-# `chunk` until it reaches `chunk_size`, at which point they're
-# concatenated together and voxel-downsampled once as a batch, keeping
-# `target`'s point count close to its true (deduplicated) size throughout
-# the merge instead of only reducing it once at the very end.
+# CLI helper: parse "--lod_multipliers" into (name, multiplier) pairs
 # ---------------------------------------------------------------------------
-def _append_chunk(
-    target: o3d.geometry.PointCloud,
-    chunk: list[o3d.geometry.PointCloud],
-    voxel_size: float,
-) -> o3d.geometry.PointCloud:
-    """Merge a bounded chunk and immediately downsample it."""
-    if not chunk:
-        return target
-    local = o3d.geometry.PointCloud()
-    for cloud in chunk:
-        local += cloud
-    chunk.clear()
-    if len(target.points):
-        target += local
-    else:
-        target = local
-    return target.voxel_down_sample(voxel_size)
+def _build_lod_levels(names: list[str], multipliers_csv: str) -> tuple[tuple[str, float], ...]:
+    try:
+        multipliers = [float(x) for x in multipliers_csv.split(",")]
+    except ValueError:
+        sys.exit(f"Error: --lod_multipliers must be a comma-separated list of numbers, got: {multipliers_csv!r}")
+    if len(multipliers) != len(names):
+        sys.exit(
+            f"Error: --lod_multipliers must have exactly {len(names)} values "
+            f"(one per LOD level: {', '.join(names)}), got {len(multipliers)}."
+        )
+    return tuple(zip(names, multipliers))
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +140,9 @@ def run(args) -> None:
             "this bag's point cloud really is already in a fixed frame."
         )
 
+    lod_level_names = [name for name, _ in DEFAULT_LOD_LEVELS]
+    lod_levels = _build_lod_levels(lod_level_names, args.lod_multipliers)
+
     required = [args.pc_topic, args.gps_topic]
     if args.odom_topic:
         required.append(args.odom_topic)
@@ -136,7 +150,7 @@ def run(args) -> None:
     if missing:
         sys.exit(
             f"Error: Required topics missing from bag: {missing}\n"
-            "Check topic names with: ros2 bag info <bag_path>"
+            "Check topic names with: ros2 bag info "
         )
 
     # -- GPS origin ----------------------------------------------------
@@ -202,14 +216,15 @@ def run(args) -> None:
 
     # -- Merge world-frame cloud -------------------------------------------
     # PERF FIX: frames are now batched into a bounded `chunk` and flushed via
-    # `_append_chunk()` every `args.merge_chunk_frames` frames, instead of
-    # calling `pcd_combined += pcd_world` unconditionally for every single
-    # selected frame. This keeps the merged cloud's point count close to its
-    # true (voxel-deduplicated) size throughout the merge, so `+=` cost stays
-    # roughly linear in the number of frames instead of growing toward O(n^2)
-    # as an ever-larger, never-reduced cloud gets re-concatenated on every
-    # iteration. `--merge_chunk_frames` now actually does what its help text
-    # describes, instead of being accepted-but-unused.
+    # the shared `merge_chunk()` helper every `args.merge_chunk_frames`
+    # frames, instead of calling `pcd_combined += pcd_world` unconditionally
+    # for every single selected frame. This keeps the merged cloud's point
+    # count close to its true (voxel-deduplicated) size throughout the
+    # merge, so `+=` cost stays roughly linear in the number of frames
+    # instead of growing toward O(n^2) as an ever-larger, never-reduced
+    # cloud gets re-concatenated on every iteration. `--merge_chunk_frames`
+    # now actually does what its help text describes, instead of being
+    # accepted-but-unused.
     print("\n[4/6] Merging registered frames (chunked, bounded memory)...")
     pcd_combined = o3d.geometry.PointCloud()
     chunk: list[o3d.geometry.PointCloud] = []
@@ -225,15 +240,14 @@ def run(args) -> None:
             timestamp=timestamp, odom_data=odom_data,
             odom_ts_sorted=odom_ts_sorted, odom_max_ns=odom_max_ns,
         )
-
         chunk.append(pcd_world)
         merged_frame_count += 1
 
         if len(chunk) >= chunk_size:
-            pcd_combined = _append_chunk(pcd_combined, chunk, args.voxel_size)
+            pcd_combined = merge_chunk(pcd_combined, chunk, args.voxel_size)
             gc.collect()
 
-    pcd_combined = _append_chunk(pcd_combined, chunk, args.voxel_size)
+    pcd_combined = merge_chunk(pcd_combined, chunk, args.voxel_size)
 
     print(f"  Merge: {merged_frame_count:,} frame(s) actually merged into the combined cloud.")
     del selected_frames, pose_by_timestamp
@@ -250,36 +264,38 @@ def run(args) -> None:
     if len(pcd_clean.points) == 0:
         sys.exit("Error: No points remain after cleaning.")
 
-    # -- Georeference + export ---------------------------------------------
-    print("\n[6/6] Georeferencing (local ENU -> ECEF) and writing 3D Tiles...")
-    tiles_dir, _ = georeference_and_export_tileset(
-        pcd_clean, lat0, lon0, alt0, out_dir, bag_path.stem, args.workers
+    # -- Georeference + export (3 LOD layers) -------------------------------
+    print("\n[6/6] Georeferencing (local ENU -> ECEF) and writing 3D Tiles LOD layers...")
+    tiles_dirs, _ = georeference_and_export_lod_tilesets(
+        pcd_clean, lat0, lon0, alt0, out_dir, bag_path.stem, args.workers,
+        base_voxel_size=args.voxel_size, lod_levels=lod_levels,
     )
 
-    print(f"\n3D Tiles written to: {tiles_dir}")
+    print("\n3D Tiles LOD layers written:")
+    for name, tiles_dir in tiles_dirs.items():
+        print(f"  {name}: {tiles_dir}")
     print("Done.")
 
 
 def build_parser(sub):
     p = sub.add_parser(
         "tiles_3d",
-        help="ROS 2 bag -> georeferenced point cloud -> Cesium 3D Tiles"
+        help="ROS 2 bag -> georeferenced point cloud -> Cesium 3D Tiles (3 LOD layers)"
     )
-
     p.add_argument("bagpath", help="Path to the ROS 2 bag directory.")
     p.add_argument("outputdir", help="Output directory.")
 
     # Topics
     p.add_argument("--pc_topic", default="points",
-        help="PointCloud2 topic (default: points).")
+                    help="PointCloud2 topic (default: points).")
     p.add_argument("--odom_topic", default=None,
-        help=(
-            "Odometry topic (nav_msgs/Odometry). Required unless the "
-            "point cloud is already published in a global/fixed frame "
-            "(see --pc_frame_mode)."
-        ))
+                    help=(
+                        "Odometry topic (nav_msgs/Odometry). Required unless the "
+                        "point cloud is already published in a global/fixed frame "
+                        "(see --pc_frame_mode)."
+                    ))
     p.add_argument("--gps_topic", default="/gps/fix",
-        help="NavSatFix topic for GPS origin (default: /gps/fix).")
+                    help="NavSatFix topic for GPS origin (default: /gps/fix).")
     p.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -332,9 +348,9 @@ def build_parser(sub):
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
     p.add_argument("--frame_stride", type=int, default=1,
-        help="Process every Nth frame.")
+                    help="Process every Nth frame.")
     p.add_argument("--max_registration_frames", type=int, default=0,
-        help="Cap total frames used for registration (0 = all).")
+                    help="Cap total frames used for registration (0 = all).")
     p.add_argument(
         "--merge_chunk_frames", type=int, default=16,
         help=(
@@ -348,9 +364,24 @@ def build_parser(sub):
         ),
     )
 
+    # LOD / multi-layer output
+    p.add_argument(
+        "--lod_multipliers", type=str, default="4.0,2.0,1.0",
+        help=(
+            "Comma-separated voxel-size multipliers (relative to --voxel_size) "
+            "for the three output LOD layers, in "
+            f"{'/'.join(name for name, _ in DEFAULT_LOD_LEVELS)} order "
+            "(default: 4.0,2.0,1.0). Each layer is voxel-downsampled at "
+            "voxel_size * multiplier and written to its own "
+            "outputdir/tileset_<name>/ folder; a multiplier of 1.0 uses the "
+            "cloud's own (already-cleaned) resolution with no extra "
+            "downsampling."
+        ),
+    )
+
     # Performance
     p.add_argument("--workers", type=int, default=4,
-        help="Parallel workers for KDTree queries and py3dtiles convert.")
+                    help="Parallel workers for KDTree queries and py3dtiles convert.")
 
     p.set_defaults(func=run)
     return p
