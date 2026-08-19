@@ -34,6 +34,13 @@ same unbounded-merge performance bug by copy-pasting this exact function
 from here. It now lives in `shared/merge_utils.py` as `merge_chunk()` and
 is imported from there by all three pipelines, so a future fix to the
 chunking logic itself only needs to be made once.
+
+PATCH NOTE (defaults aligned to Bellhop GUI):
+`--pc_topic`, `--voxel_size`, `--frame_stride`, `--loop_closure_radius`,
+`--workers`, and `--height_colormap` now default to the same values the
+GUI's Mesh profile always sent (`/points`, `0.05`, `2`, `3.0`, `1`, and
+`gray` respectively), so a bare CLI invocation with no flags now produces
+the exact same behavior as a GUI-launched run with no changes.
 """
 
 from __future__ import annotations
@@ -231,6 +238,7 @@ def run(args: argparse.Namespace) -> None:
     selected_frames, _original_indices = select_registration_frames(
         frames, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
     )
+
     print(
         f"Coverage: frames selected = {len(selected_frames):,} / {len(frames):,} "
         f"(stride={args.frame_stride}, max={args.max_registration_frames})."
@@ -327,7 +335,7 @@ def build_parser(sub):
     )
     parser.add_argument("bag_path", help="Path to the ROS 2 bag.")
     parser.add_argument("output_dir", help="Output directory.")
-    parser.add_argument("--pc_topic", default="points")
+    parser.add_argument("--pc_topic", default="/points")
     parser.add_argument(
         "--odom_topic",
         default=None,
@@ -348,13 +356,12 @@ def build_parser(sub):
             "override when a bag's frame_id is missing, wrong, or empty."
         ),
     )
-
-    parser.add_argument("--voxel_size", type=float, default=0.10)
+    parser.add_argument("--voxel_size", type=float, default=0.05)
     parser.add_argument("--min_frame_points", type=int, default=100)
     parser.add_argument(
         "--frame_stride",
         type=int,
-        default=1,
+        default=2,
         help="Use every Nth cloud for registration and merging.",
     )
     parser.add_argument(
@@ -373,7 +380,6 @@ def build_parser(sub):
         default=16,
         help="Frames merged before each voxel reduction.",
     )
-
     parser.add_argument("--odom_max_latency", type=float, default=0.5)
 
     parser.add_argument(
@@ -405,11 +411,10 @@ def build_parser(sub):
         default=15.0,
         help="Max allowed ICP correction rotation (degrees) relative to the odom guess.",
     )
-
     parser.add_argument(
         "--enable_loop_closure", action="store_true", default=False
     )
-    parser.add_argument("--loop_closure_radius", type=float, default=10.0)
+    parser.add_argument("--loop_closure_radius", type=float, default=3.0)
     parser.add_argument(
         "--loop_closure_fitness_thresh",
         type=float,
@@ -446,13 +451,12 @@ def build_parser(sub):
     parser.add_argument(
         "--height_colormap",
         choices=["jet", "hot", "cool", "gray"],
-        default=None,
+        default="gray",
         help=(
             "Also export a per-vertex height-colored PLY (baked directly "
             "into the mesh's vertex colors)."
         ),
     )
-
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=1)
     parser.set_defaults(func=run)
     return parser

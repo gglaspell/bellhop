@@ -70,6 +70,13 @@ copy-pasted `_append_chunk()`. All three copies now live in one place,
 `shared/merge_utils.py` (`merge_chunk()`), imported from there instead of
 redefined locally, so a future fix to the chunking logic only needs to be
 made once.
+
+PATCH NOTE (defaults aligned to Bellhop GUI):
+`--pc_topic`, `--workers`, `--frame_stride`, and `--loop_closure_radius`
+now default to the same values the GUI's Gazebo World profile always
+sent (`/points`, `1`, `2`, and `3.0` respectively), so a bare CLI
+invocation with no flags now produces the exact same behavior as a
+GUI-launched run with no changes.
 """
 
 import argparse
@@ -98,7 +105,6 @@ from .shared.ros_io import (
     interpolate_odom_pose,
     resolve_pc_frame_mode,
 )
-
 
 # ---------------------------------------------------------------------------
 # Gazebo template strings
@@ -256,6 +262,7 @@ def run(args) -> None:
     selected_frames, _original_indices = select_registration_frames(
         pointclouds, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
     )
+
     print(
         f"Coverage: frames selected = {len(selected_frames):,} / {len(pointclouds):,} "
         f"(stride={args.frame_stride}, max={args.max_registration_frames})."
@@ -386,14 +393,14 @@ def build_parser(sub):
     p.add_argument("outputdir", help="Output directory.")
 
     # Topics
-    p.add_argument("--pc_topic", default="points",
-                    help="PointCloud2 topic (default: points).")
+    p.add_argument("--pc_topic", default="/points",
+                   help="PointCloud2 topic (default: /points).")
     p.add_argument("--odom_topic", default=None,
-                    help=(
-                        "Odometry topic (nav_msgs/Odometry). Required unless the "
-                        "point cloud is already published in a global/fixed frame "
-                        "(see --pc_frame_mode)."
-                    ))
+                   help=(
+                       "Odometry topic (nav_msgs/Odometry). Required unless the "
+                       "point cloud is already published in a global/fixed frame "
+                       "(see --pc_frame_mode)."
+                   ))
     p.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -409,9 +416,9 @@ def build_parser(sub):
 
     # Gazebo
     p.add_argument("--model_name", default="bag_environment",
-                    help="Gazebo model name (default: bag_environment).")
+                   help="Gazebo model name (default: bag_environment).")
     p.add_argument("--gazebo_material", default="Gazebo/Grey",
-                    help="Gazebo material (e.g. Gazebo/White, Gazebo/Wood).")
+                   help="Gazebo material (e.g. Gazebo/White, Gazebo/Wood).")
 
     # Registration
     p.add_argument("--voxel_size", type=float, default=0.05)
@@ -441,7 +448,7 @@ def build_parser(sub):
         help="Max allowed ICP correction rotation (degrees) relative to the odom guess.",
     )
     p.add_argument("--enable_loop_closure", action="store_true", default=False)
-    p.add_argument("--loop_closure_radius", type=float, default=10.0)
+    p.add_argument("--loop_closure_radius", type=float, default=3.0)
     p.add_argument(
         "--loop_closure_fitness_thresh", type=float, default=0.7,
         help="Defaults to the same bar as --icp_fitness_thresh, not a separate looser value.",
@@ -451,10 +458,10 @@ def build_parser(sub):
         "--loop_closure_temporal_window", type=int, default=100,
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
-    p.add_argument("--frame_stride", type=int, default=1,
-                    help="Process every Nth frame.")
+    p.add_argument("--frame_stride", type=int, default=2,
+                   help="Process every Nth frame.")
     p.add_argument("--max_registration_frames", type=int, default=0,
-                    help="Cap total frames used for registration (0 = all).")
+                   help="Cap total frames used for registration (0 = all).")
     p.add_argument(
         "--merge_chunk_frames", type=int, default=16,
         help=(
@@ -468,13 +475,13 @@ def build_parser(sub):
 
     # Reconstruction
     p.add_argument("--poisson_depth", type=int, default=0,
-                    help="Poisson depth (0 = auto).")
+                   help="Poisson depth (0 = auto).")
     p.add_argument("--min_density_percentile", type=float, default=1.0,
-                    help="Bottom %% of Poisson vertex densities to trim (default 1.0).")
+                   help="Bottom %% of Poisson vertex densities to trim (default 1.0).")
     p.add_argument("--distance_multiplier", type=float, default=3.0,
-                    help="Adaptive vertex distance trim multiplier (default 3.0).")
+                   help="Adaptive vertex distance trim multiplier (default 3.0).")
     p.add_argument("--max_vertex_distance", type=float, default=0.0,
-                    help="Hard cap on vertex distance (m); 0 = disabled.")
+                   help="Hard cap on vertex distance (m); 0 = disabled.")
     # FIX: previously registered as two separate manual flags,
     # `--remesh` (store_true) and `--no_remesh` (dest="remesh",
     # store_false, underscore). gui.py always emits the hyphenated
@@ -492,15 +499,15 @@ def build_parser(sub):
         help="Run isotropic remesh + smooth after Poisson (default: on).",
     )
     p.add_argument("--remesh_smooth_iterations", type=int, default=5,
-                    help="Laplacian smooth iterations during remesh (default 5).")
+                   help="Laplacian smooth iterations during remesh (default 5).")
     p.add_argument("--decimate_target", type=float, default=None,
-                    help="<=1.0 = fraction of triangles; >1 = absolute count; None = skip.")
+                   help="<=1.0 = fraction of triangles; >1 = absolute count; None = skip.")
     p.add_argument("--curvature_percentile", type=float, default=80.0,
-                    help="Percentile threshold for curvature-aware decimation (default 80.0).")
+                   help="Percentile threshold for curvature-aware decimation (default 80.0).")
     p.add_argument("--curvature_protect_rings", type=int, default=1,
-                    help="Ring dilation for curvature protection (default 1).")
+                   help="Ring dilation for curvature protection (default 1).")
     p.add_argument("--level_floor", action="store_true", default=False)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=1)
 
     p.set_defaults(func=run)
     return p

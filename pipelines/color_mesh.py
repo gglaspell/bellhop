@@ -65,6 +65,12 @@ post-process on the already-remeshed output file, so remeshing there is
 harmless), this pipeline bakes color onto the point cloud before Poisson
 reconstruction, so any remesh step downstream of it would destroy that
 color. `create_mesh()` is now always called with `remesh=False`.
+
+PATCH NOTE (defaults aligned to Bellhop GUI):
+`--pc_topic`, `--frame_stride`, and `--loop_closure_radius` now default to
+the same values the GUI's Color Mesh profile always sent (`/points`, `2`,
+and `3.0` respectively), so a bare CLI invocation with no flags now
+produces the exact same behavior as a GUI-launched run with no changes.
 """
 
 from __future__ import annotations
@@ -193,7 +199,6 @@ def _read_registration_data(
             for connection in reader.connections
             if connection.topic in topics
         ]
-
         for connection, timestamp, raw in tqdm(
             reader.messages(connections=connections),
             desc="Reading",
@@ -344,7 +349,6 @@ def _stream_colored_merge(
             for connection in reader.connections
             if connection.topic in topics
         ]
-
         for connection, timestamp, raw in tqdm(
             reader.messages(connections=connections),
             desc="Merging",
@@ -403,7 +407,6 @@ def _stream_colored_merge(
         f"{fallback_gray_count:,} frame(s) used fallback gray "
         f"({camera_colored_count}/{merged_frame_count} real color coverage)."
     )
-
     if merged_frame_count and fallback_gray_count == merged_frame_count:
         print(
             "Warning: EVERY merged frame fell back to gray -- no frame was ever "
@@ -455,6 +458,7 @@ def run(args) -> None:
     selected_frames, _original_indices = select_registration_frames(
         frames, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
     )
+
     print(
         f"Coverage: frames selected = {len(selected_frames):,} / {len(frames):,} "
         f"(stride={args.frame_stride}, max={args.max_registration_frames})."
@@ -548,11 +552,10 @@ def build_parser(sub):
         "color_mesh",
         help="ROS 2 bag -> memory-bounded camera-coloured Poisson mesh",
     )
-
     parser.add_argument("bagpath", help="Path to the ROS 2 bag.")
     parser.add_argument("outputdir", help="Output directory.")
 
-    parser.add_argument("--pc_topic", default="points")
+    parser.add_argument("--pc_topic", default="/points")
     parser.add_argument(
         "--odom_topic",
         default=None,
@@ -588,7 +591,7 @@ def build_parser(sub):
     parser.add_argument(
         "--frame_stride",
         type=int,
-        default=1,
+        default=2,
         help="Use every Nth cloud for registration and colouring.",
     )
     parser.add_argument(
@@ -603,7 +606,6 @@ def build_parser(sub):
         default=16,
         help="Frames merged before each voxel reduction.",
     )
-
     parser.add_argument("--odom_max_latency", type=float, default=0.5)
 
     parser.add_argument(
@@ -635,9 +637,8 @@ def build_parser(sub):
         default=15.0,
         help="Max allowed ICP correction rotation (degrees) relative to the odom guess.",
     )
-
     parser.add_argument("--enable_loop_closure", action="store_true", default=False)
-    parser.add_argument("--loop_closure_radius", type=float, default=10.0)
+    parser.add_argument("--loop_closure_radius", type=float, default=3.0)
     parser.add_argument(
         "--loop_closure_fitness_thresh",
         type=float,

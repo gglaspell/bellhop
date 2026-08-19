@@ -80,6 +80,13 @@ default, configurable via `--lod_multipliers`) and each density is written
 into its own `tileset_<name>/` subfolder under `outputdir`, so a Cesium
 viewer can offer a quality/performance toggle between layers instead of
 being stuck with one fixed-resolution tileset.
+
+PATCH NOTE (defaults aligned to Bellhop GUI):
+`--pc_topic`, `--workers`, `--frame_stride`, and `--loop_closure_radius`
+now default to the same values the GUI's 3D Tiles profile always sent
+(`/points`, `1`, `2`, and `3.0` respectively), so a bare CLI invocation
+with no flags now produces the exact same behavior as a GUI-launched run
+with no changes.
 """
 
 import gc
@@ -150,7 +157,7 @@ def run(args) -> None:
     if missing:
         sys.exit(
             f"Error: Required topics missing from bag: {missing}\n"
-            "Check topic names with: ros2 bag info "
+            "Check topic names with: ros2 bag info <bag>"
         )
 
     # -- GPS origin ----------------------------------------------------
@@ -187,6 +194,7 @@ def run(args) -> None:
     selected_frames, _original_indices = select_registration_frames(
         pointclouds, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
     )
+
     print(
         f"  Coverage: frames selected = {len(selected_frames):,} / {len(pointclouds):,} "
         f"(stride={args.frame_stride}, max={args.max_registration_frames})."
@@ -286,16 +294,16 @@ def build_parser(sub):
     p.add_argument("outputdir", help="Output directory.")
 
     # Topics
-    p.add_argument("--pc_topic", default="points",
-                    help="PointCloud2 topic (default: points).")
+    p.add_argument("--pc_topic", default="/points",
+                   help="PointCloud2 topic (default: /points).")
     p.add_argument("--odom_topic", default=None,
-                    help=(
-                        "Odometry topic (nav_msgs/Odometry). Required unless the "
-                        "point cloud is already published in a global/fixed frame "
-                        "(see --pc_frame_mode)."
-                    ))
+                   help=(
+                       "Odometry topic (nav_msgs/Odometry). Required unless the "
+                       "point cloud is already published in a global/fixed frame "
+                       "(see --pc_frame_mode)."
+                   ))
     p.add_argument("--gps_topic", default="/gps/fix",
-                    help="NavSatFix topic for GPS origin (default: /gps/fix).")
+                   help="NavSatFix topic for GPS origin (default: /gps/fix).")
     p.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -337,7 +345,7 @@ def build_parser(sub):
         help="Max allowed ICP correction rotation (degrees) relative to the odom guess.",
     )
     p.add_argument("--enable_loop_closure", action="store_true", default=False)
-    p.add_argument("--loop_closure_radius", type=float, default=10.0)
+    p.add_argument("--loop_closure_radius", type=float, default=3.0)
     p.add_argument(
         "--loop_closure_fitness_thresh", type=float, default=0.7,
         help="Defaults to the same bar as --icp_fitness_thresh, not a separate looser value.",
@@ -347,10 +355,10 @@ def build_parser(sub):
         "--loop_closure_temporal_window", type=int, default=100,
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
-    p.add_argument("--frame_stride", type=int, default=1,
-                    help="Process every Nth frame.")
+    p.add_argument("--frame_stride", type=int, default=2,
+                   help="Process every Nth frame.")
     p.add_argument("--max_registration_frames", type=int, default=0,
-                    help="Cap total frames used for registration (0 = all).")
+                   help="Cap total frames used for registration (0 = all).")
     p.add_argument(
         "--merge_chunk_frames", type=int, default=16,
         help=(
@@ -380,8 +388,8 @@ def build_parser(sub):
     )
 
     # Performance
-    p.add_argument("--workers", type=int, default=4,
-                    help="Parallel workers for KDTree queries and py3dtiles convert.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Parallel workers for KDTree queries and py3dtiles convert.")
 
     p.set_defaults(func=run)
     return p

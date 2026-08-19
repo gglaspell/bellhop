@@ -74,24 +74,26 @@ occupancy semantics used by the validated hybrid method:
 2. Full-resolution points (not yet voxel-downsampled) were ray-cast into
    the tree every frame -- the existing `--voxel_size` downsample only
    ran *after* insertion, on the copy kept for ground/obstacle
-   separation. `--octree_discretize` (default: off, opt-in) sets
-   `discretize=True`, which snaps the scan onto the octree's own voxel
-   grid before casting rays, collapsing many same-voxel points into one
-   ray. It's opt-in rather than default because it changes which exact
-   points contribute to each ray (occupied nodes still take precedence
-   over free ones, per OctoMap's `computeDiscreteUpdate()`), so it's a
-   deliberate accuracy/speed tradeoff left to the operator.
-3. Every ray was cast the complete beam length (`maxrange=-1.0`), so
-   distant returns cost proportionally more voxel traversals. The new
-   `--octree_max_range` (default: -1.0, i.e. unchanged/unlimited) lets an
-   operator cap beam length when far returns aren't needed for the
-   ground/obstacle band being mapped.
+   separation. `--octree_discretize` (default: on) sets `discretize=True`,
+   which snaps the scan onto the octree's own voxel grid before casting
+   rays, collapsing many same-voxel points into one ray. This changes
+   which exact points contribute to each ray (occupied nodes still take
+   precedence over free ones, per OctoMap's `computeDiscreteUpdate()`),
+   which is a deliberate accuracy/speed tradeoff now enabled by default;
+   pass `--no-octree_discretize`-equivalent behavior is not available as
+   a flag but the operator may set `--octree_discretize` explicitly if
+   they need to reason about it.
+3. Every ray was previously cast the complete beam length (`maxrange=-1.0`),
+   so distant returns cost proportionally more voxel traversals.
+   `--octree_max_range` (default: 40.0 m) now caps beam length by default
+   for the ground/obstacle band this pipeline maps; pass a larger value
+   (or -1.0 for unlimited) if far returns are needed.
 
-None of these defaults change output for a bag run with all-default
-flags except `--octree_lazy_eval`, which is now on by default because it
-is mathematically a no-op reordering (deferred recomputation, immediately
-reconciled via `updateInnerOccupancy()` before any query) rather than an
-approximation.
+These defaults (`--octree_lazy_eval` on, `--octree_discretize` on,
+`--octree_max_range` 40.0) match the Bellhop GUI's OG Map profile
+defaults, so a run launched from the GUI with no changes and one
+launched from the bare CLI with no flags now produce identical
+`docker run` commands.
 """
 
 from __future__ import annotations
@@ -351,9 +353,9 @@ def _create_hybrid_occupancy_grid(
     Query OcTree occupancy in a vertical band above each ground cell.
 
     Values:
-        0   occupied
-        127 unknown
-        254 free
+      0   occupied
+      127 unknown
+      254 free
     """
     y_size, x_size = ground_height_map.shape
 
@@ -616,10 +618,10 @@ def run(args) -> None:
                 # PERF: lazy_eval defers inner-node occupancy recomputation
                 # until updateInnerOccupancy() is called once below (see
                 # PERF NOTE at module top) instead of on every frame;
-                # discretize (opt-in) snaps the scan onto the octree's own
+                # discretize snaps the scan onto the octree's own
                 # voxel grid before ray casting to avoid redundant rays
                 # from a still-full-resolution frame; max_range caps beam
-                # length (unlimited by default, matching prior behavior).
+                # length (40 m by default; pass -1.0 for unlimited).
                 obstacle_tree.insertPointCloud(
                     points,
                     sensor_origin,
@@ -779,19 +781,17 @@ def build_parser(sub):
         "og_map",
         help="ROS 2 bag -> Nav2 occupancy grid (.pgm + .yaml)",
     )
-
     parser.add_argument("input_bag")
     parser.add_argument("output_path")
 
     parser.add_argument(
         "--pc_topic",
-        default="/dlio/odom_node/pointcloud/deskewed",
+        default="/points",
     )
     parser.add_argument(
         "--odom_topic",
-        default="/dlio/odom_node/odom",
+        default="/odom",
     )
-
     parser.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -809,17 +809,17 @@ def build_parser(sub):
     )
 
     parser.add_argument("--octree_res", type=float, default=0.1)
-    parser.add_argument("--grid_res", type=float, default=0.05)
+    parser.add_argument("--grid_res", type=float, default=0.10)
     parser.add_argument("--slope_deg", type=float, default=15.0)
     parser.add_argument("--normal_radius", type=float, default=0.2)
     parser.add_argument("--z_min", type=float, default=0.1)
     parser.add_argument("--z_max", type=float, default=2.0)
-    parser.add_argument("--voxel_size", type=float, default=0.05)
+    parser.add_argument("--voxel_size", type=float, default=0.10)
 
     parser.add_argument(
         "--frame_stride",
         type=int,
-        default=1,
+        default=2,
         help="Process every Nth PointCloud2 frame.",
     )
     parser.add_argument(
@@ -828,7 +828,6 @@ def build_parser(sub):
         default=0,
         help="Maximum selected PointCloud2 frames; 0 means all.",
     )
-
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min_cluster_size", type=int, default=20)
     parser.add_argument("--closing_iters", type=int, default=1)
@@ -839,18 +838,18 @@ def build_parser(sub):
         default=0.5,
     )
 
-    # PERF: new flags controlling OcTree insertion (step [2/6]). See the
+    # PERF: flags controlling OcTree insertion (step [2/6]). See the
     # "PERF NOTE" in this file's module docstring for why each exists.
+    # Defaults below match the Bellhop GUI's OG Map profile exactly.
     parser.add_argument(
         "--octree_max_range",
         type=float,
-        default=-1.0,
+        default=40.0,
         help=(
             "Max ray-casting beam length (m) per point during OcTree "
-            "insertion; -1.0 (default) casts the complete beam, matching "
-            "prior behavior. Capping this reduces per-frame insertion cost "
-            "on bags with long-range returns not needed for the mapped "
-            "z_min/z_max band."
+            "insertion; default 40.0 caps beam length for the mapped "
+            "z_min/z_max band. Pass -1.0 to cast the complete beam "
+            "(unlimited) if far returns are needed."
         ),
     )
     parser.add_argument(
@@ -874,14 +873,20 @@ def build_parser(sub):
     parser.add_argument(
         "--octree_discretize",
         action="store_true",
-        default=False,
+        default=True,
         help=(
             "Snap each frame onto the OcTree's own voxel grid before ray "
-            "casting (default: off, opt-in). Collapses multiple same-voxel "
+            "casting (default: on). Collapses multiple same-voxel "
             "points into one ray per frame, which speeds up insertion on "
             "dense point clouds at the cost of using a discretized "
             "approximation of each frame rather than every raw point."
         ),
+    )
+    parser.add_argument(
+        "--no-octree_discretize",
+        dest="octree_discretize",
+        action="store_false",
+        help="Disable --octree_discretize (ray-cast every raw point).",
     )
 
     parser.set_defaults(func=run)
