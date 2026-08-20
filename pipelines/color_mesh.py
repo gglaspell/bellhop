@@ -7,22 +7,22 @@ pointcloud-frame-check-prompt-2.md. Mirrors the same change applied to
 `mesh.py`, since both pipelines share the same registration/merge pattern:
 
 - The point cloud's frame_id is detected (or overridden via
---pc_frame_mode) and classified as 'global' (already in a fixed frame:
-odom/map/world) or 'local' (a moving sensor/base frame).
+  --pc_frame_mode) and classified as 'global' (already in a fixed frame:
+  odom/map/world) or 'local' (a moving sensor/base frame).
 - 'local' frames are registered via `run_odom_anchored_registration()`,
-which makes timestamped odometry the PRIMARY pose source and demotes ICP
-to an optional, strongly-gated local refinement (--enable_icp_refinement,
-default off). Frames are only ever dropped for lacking odometry coverage,
-never for failing an ICP fitness check.
+  which makes timestamped odometry the PRIMARY pose source and demotes ICP
+  to an optional, strongly-gated local refinement (--enable_icp_refinement,
+  default off). Frames are only ever dropped for lacking odometry coverage,
+  never for failing an ICP fitness check.
 - 'global' frames skip registration entirely: no ICP, no per-frame
-transform is applied, frames are streamed/filtered/downsampled/merged
-(and camera-coloured) directly. Odom (if provided) is still used to
-locate the camera origin for projecting images onto the cloud and for
-view-ray normal orientation, since there is no separate registration
-transform in this branch to create a frame mismatch.
+  transform is applied, frames are streamed/filtered/downsampled/merged
+  (and camera-coloured) directly. Odom (if provided) is still used to
+  locate the camera origin for projecting images onto the cloud and for
+  view-ray normal orientation, since there is no separate registration
+  transform in this branch to create a frame mismatch.
 - CAVEAT: the frame check only detects whether the cloud is already in a
-fixed/global frame -- it does NOT correct for a real sensor-to-base_link
-extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
+  fixed/global frame -- it does NOT correct for a real sensor-to-base_link
+  extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
 
 PATCH NOTE (motion-gated frame selection + odometry health check):
 `--frame_stride` has been removed in favor of motion-gated selection:
@@ -40,23 +40,23 @@ this docstring.
 
 PATCH NOTE (total color loss fix, see fix_pointcloud_color_loss_prompt.md):
 - Root cause 1: `_color_pcd_from_image` was only invoked inside the
-"image + intrinsics found in time" branch of `flush()`, with no `else`.
-Frames that missed that condition entered the merge with
-`pcd.has_colors() == False`. Fixed: every frame now gets an explicit
-neutral-gray fallback color when it can't be camera-colored, so it always
-has a colors array of the correct length before merging.
+  "image + intrinsics found in time" branch of `flush()`, with no `else`.
+  Frames that missed that condition entered the merge with
+  `pcd.has_colors() == False`. Fixed: every frame now gets an explicit
+  neutral-gray fallback color when it can't be camera-colored, so it always
+  has a colors array of the correct length before merging.
 - Root cause 2: `_merge_chunk` combined clouds with `+=`/`+`. Open3D's
-`PointCloud.__add__`/`__iadd__` clears color on the ENTIRE result if
-either operand lacks a colors array -- so a single frame missing colors
-(root cause 1) would wipe out coloring for everything merged after it,
-which is exactly why the final mesh/cloud was totally colorless instead
-of just patchy. Fixed: merging is now done via manual numpy
-concatenation + explicit Vector3dVector assignment, which never invokes
-Open3D's add operators and is therefore immune to this behavior.
+  `PointCloud.__add__`/`__iadd__` clears color on the ENTIRE result if
+  either operand lacks a colors array -- so a single frame missing colors
+  (root cause 1) would wipe out coloring for everything merged after it,
+  which is exactly why the final mesh/cloud was totally colorless instead
+  of just patchy. Fixed: merging is now done via manual numpy
+  concatenation + explicit Vector3dVector assignment, which never invokes
+  Open3D's add operators and is therefore immune to this behavior.
 - Added a running/report count of frames colored from the camera vs.
-frames that fell back to gray, printed at the end of the merge pass, so
-a future regression is visible immediately as "N/M frames used fallback
-gray" instead of resurfacing as silent total color loss.
+  frames that fell back to gray, printed at the end of the merge pass, so
+  a future regression is visible immediately as "N/M frames used fallback
+  gray" instead of resurfacing as silent total color loss.
 
 REFACTOR NOTE (shared color-projection helpers):
 The camera-projection coloring math, the fallback-gray guarantee, the
@@ -79,6 +79,36 @@ post-process on the already-remeshed output file, so remeshing there is
 harmless), this pipeline bakes color onto the point cloud before Poisson
 reconstruction, so any remesh step downstream of it would destroy that
 color. `create_mesh()` is now always called with `remesh=False`.
+
+PATCH NOTE (global gray-fill cleanup pass, see gray_fill_global_pass_prompt.md
+-- the "hallway problem"):
+`_remove_local_gray_fill()` was previously only ever invoked from inside
+`_merge_chunk()`, i.e. it only ever compared points within the same batch
+of `--merge_chunk_frames` frames. Consider a robot with a front-facing
+camera and a 360-degree LIDAR that drives up a hallway, turns around, and
+drives back down the same hallway: on the way in the front camera faces
+the direction of travel and the walls get real camera color; after the
+turn-around the 360-degree LIDAR still sees the same walls, but the front
+camera now faces the opposite direction, so those returns fall outside the
+camera's FOV and get the neutral-gray fallback instead. The outbound and
+return passes are almost always separated by many more frames than one
+chunk, so the chunk-local filter can never compare the gray return-pass
+points against the colored outbound-pass points describing the same
+physical surface -- both a colored point and a nearby gray "ghost" point
+would otherwise survive into the final cloud (visible as speckled/dull
+patches on any surface seen from two different directions).
+
+Fixed by adding a **second, global** call to the same
+`_remove_local_gray_fill()` helper (no change to the helper's internal
+logic -- it is scope-agnostic and only ever operates on whatever cloud
+object it is given) in `run()`, run exactly once against the fully merged
+cloud right after streaming/chunked merging completes and the cloud is
+confirmed to have colors, but before `level_floor`/`clean_point_cloud`
+run on it. The existing chunk-local call inside `_merge_chunk` is left in
+place -- it's cheap and reduces how much duplicate data the global pass
+has to search later. The number of points removed by the global pass is
+now printed, so gray/colored duplicate cleanup is visible in the
+pipeline's output logs instead of happening silently.
 
 PATCH NOTE (defaults aligned to Bellhop GUI):
 `--pc_topic` and `--loop_closure_radius` now default to the same values
@@ -136,6 +166,12 @@ def _remove_local_gray_fill(
     helper: this pipeline's chunks carry per-point normals (view rays)
     by the time they reach this function, so those are threaded through
     as an extra array and reattached to the filtered result.
+
+    Scope-agnostic: this function only ever operates on whatever cloud
+    object it is given, so it is called both per-chunk (inside
+    `_merge_chunk`) and once globally against the fully merged cloud (in
+    `run()`, see the "hallway problem" PATCH NOTE at the top of this
+    file) with no change to its own logic.
     """
     if radius <= 0 or not pcd.has_colors() or not len(pcd.points):
         return pcd
@@ -209,6 +245,7 @@ def _read_registration_data(
             for connection in reader.connections
             if connection.topic in topics
         ]
+
         for connection, timestamp, raw in tqdm(
             reader.messages(connections=connections),
             desc="Reading",
@@ -359,6 +396,7 @@ def _stream_colored_merge(
             for connection in reader.connections
             if connection.topic in topics
         ]
+
         for connection, timestamp, raw in tqdm(
             reader.messages(connections=connections),
             desc="Merging",
@@ -417,6 +455,7 @@ def _stream_colored_merge(
         f"{fallback_gray_count:,} frame(s) used fallback gray "
         f"({camera_colored_count}/{merged_frame_count} real color coverage)."
     )
+
     if merged_frame_count and fallback_gray_count == merged_frame_count:
         print(
             "Warning: EVERY merged frame fell back to gray -- no frame was ever "
@@ -509,6 +548,34 @@ def run(args) -> None:
     if not len(pcd_combined.points):
         sys.exit("Error: No registered points were produced.")
 
+    # PATCH NOTE (global gray-fill cleanup pass -- the "hallway problem",
+    # see gray_fill_global_pass_prompt.md and the module docstring above):
+    # `_remove_local_gray_fill()` above only ever compares points within a
+    # single `--merge_chunk_frames` chunk. A gray-fallback point from one
+    # part of the trajectory (e.g. a hallway wall seen only from behind
+    # after a turn-around, with no matching camera frame) and a genuinely
+    # colored point describing the same physical surface (seen on an
+    # earlier outbound pass) can easily end up many chunks apart and are
+    # never compared against each other by the chunk-local pass alone.
+    # Run the same scope-agnostic helper exactly once more, now against
+    # the FULLY merged/voxelized cloud, before any floor-leveling or final
+    # cleanup runs -- this is cheap relative to the chunk-local pass since
+    # by this point the cloud is already voxel-downsampled to its final
+    # resolution, and it reconciles gray/colored duplicates that span
+    # arbitrarily large temporal gaps in the trajectory.
+    if pcd_combined.has_colors() and args.gray_filter_radius > 0:
+        points_before_global_pass = len(pcd_combined.points)
+        pcd_combined = _remove_local_gray_fill(pcd_combined, args.gray_filter_radius)
+        removed_by_global_pass = points_before_global_pass - len(pcd_combined.points)
+        print(
+            f"Global gray-fill cleanup: removed {removed_by_global_pass:,} "
+            f"gray-fallback point(s) with a real-color neighbor anywhere in the "
+            f"merged cloud ({points_before_global_pass:,} -> "
+            f"{len(pcd_combined.points):,} points)."
+        )
+    elif args.gray_filter_radius > 0:
+        print("Global gray-fill cleanup: skipped (merged cloud has no colors).")
+
     if args.level_floor:
         pcd_combined = level_floor(pcd_combined)
 
@@ -522,6 +589,7 @@ def run(args) -> None:
         if pcd_clean.has_normals()
         else None
     )
+
     estimate_geometric_normals_oriented(pcd_clean, args.voxel_size, view_rays)
 
     print("Running Poisson reconstruction...")
@@ -565,6 +633,7 @@ def build_parser(sub):
         "color_mesh",
         help="ROS 2 bag -> memory-bounded camera-coloured Poisson mesh",
     )
+
     parser.add_argument("bagpath", help="Path to the ROS 2 bag.")
     parser.add_argument("outputdir", help="Output directory.")
 
@@ -589,13 +658,32 @@ def build_parser(sub):
             "override when a bag's frame_id is missing, wrong, or empty."
         ),
     )
+
     parser.add_argument("--camera_topic", required=True)
     parser.add_argument("--camera_info_topic", required=True)
 
     parser.add_argument("--max_time_diff", type=float, default=0.1)
     parser.add_argument("--color_min_depth", type=float, default=0.1)
     parser.add_argument("--color_max_depth", type=float, default=None)
-    parser.add_argument("--gray_filter_radius", type=float, default=0.05)
+    parser.add_argument(
+        "--gray_filter_radius",
+        type=float,
+        default=0.05,
+        help=(
+            "Gray-fallback points with a real-colored neighbor within this "
+            "radius (m) are removed. Governs BOTH the per-chunk cleanup pass "
+            "(inside each --merge_chunk_frames batch) AND a second, global "
+            "pass run once against the fully merged cloud (see the 'hallway "
+            "problem' PATCH NOTE at the top of this file) that reconciles "
+            "gray/colored duplicates separated by many chunks -- e.g. the "
+            "same wall seen once from the front camera's FOV and once from "
+            "outside it after a turn-around. Set to 0 to disable both passes. "
+            "Should generally be set to at least --voxel_size: points closer "
+            "together than one voxel are unlikely to exist after "
+            "downsampling, so a smaller radius may fail to find any "
+            "neighbor at all and remove nothing."
+        ),
+    )
 
     parser.add_argument("--voxel_size", type=float, default=0.05)
     parser.add_argument("--min_frame_points", type=int, default=100)
@@ -637,6 +725,7 @@ def build_parser(sub):
         default=16,
         help="Frames merged before each voxel reduction.",
     )
+
     parser.add_argument("--odom_max_latency", type=float, default=0.5)
 
     parser.add_argument(
@@ -689,6 +778,7 @@ def build_parser(sub):
         default=15.0,
         help="Max allowed ICP correction rotation (degrees) relative to the odom guess.",
     )
+
     parser.add_argument("--enable_loop_closure", action="store_true", default=False)
     parser.add_argument("--loop_closure_radius", type=float, default=3.0)
     parser.add_argument(
@@ -704,6 +794,7 @@ def build_parser(sub):
         default=100,
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
+
     parser.add_argument(
         "--poisson_depth",
         type=int,
