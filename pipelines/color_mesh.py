@@ -7,42 +7,56 @@ pointcloud-frame-check-prompt-2.md. Mirrors the same change applied to
 `mesh.py`, since both pipelines share the same registration/merge pattern:
 
 - The point cloud's frame_id is detected (or overridden via
-  --pc_frame_mode) and classified as 'global' (already in a fixed frame:
-  odom/map/world) or 'local' (a moving sensor/base frame).
+--pc_frame_mode) and classified as 'global' (already in a fixed frame:
+odom/map/world) or 'local' (a moving sensor/base frame).
 - 'local' frames are registered via `run_odom_anchored_registration()`,
-  which makes timestamped odometry the PRIMARY pose source and demotes ICP
-  to an optional, strongly-gated local refinement (--enable_icp_refinement,
-  default off). Frames are only ever dropped for lacking odometry coverage,
-  never for failing an ICP fitness check.
+which makes timestamped odometry the PRIMARY pose source and demotes ICP
+to an optional, strongly-gated local refinement (--enable_icp_refinement,
+default off). Frames are only ever dropped for lacking odometry coverage,
+never for failing an ICP fitness check.
 - 'global' frames skip registration entirely: no ICP, no per-frame
-  transform is applied, frames are streamed/filtered/downsampled/merged
-  (and camera-coloured) directly. Odom (if provided) is still used to
-  locate the camera origin for projecting images onto the cloud and for
-  view-ray normal orientation, since there is no separate registration
-  transform in this branch to create a frame mismatch.
+transform is applied, frames are streamed/filtered/downsampled/merged
+(and camera-coloured) directly. Odom (if provided) is still used to
+locate the camera origin for projecting images onto the cloud and for
+view-ray normal orientation, since there is no separate registration
+transform in this branch to create a frame mismatch.
 - CAVEAT: the frame check only detects whether the cloud is already in a
-  fixed/global frame -- it does NOT correct for a real sensor-to-base_link
-  extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
+fixed/global frame -- it does NOT correct for a real sensor-to-base_link
+extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
+
+PATCH NOTE (motion-gated frame selection + odometry health check):
+`--frame_stride` has been removed in favor of motion-gated selection:
+`--min_move_distance`/`--min_rotation_angle_deg` now keep a frame only if
+it has actually moved/turned relative to the last KEPT frame's odometry
+pose (OR'd together), instead of thinning purely by message count. An
+odometry health check now runs automatically (unless
+--disable_odom_health_check) and truncates registration at the first
+detected tracking loss/teleport in the raw odometry stream, before any
+frame is selected -- see `shared/registration.py` for the full design.
+Both changes are handled internally by `run_odom_anchored_registration()`;
+this file only had to change its argparse surface, its read-ahead cap
+(now bounding RAW frames read rather than a stride-thinned count), and
+this docstring.
 
 PATCH NOTE (total color loss fix, see fix_pointcloud_color_loss_prompt.md):
 - Root cause 1: `_color_pcd_from_image` was only invoked inside the
-  "image + intrinsics found in time" branch of `flush()`, with no `else`.
-  Frames that missed that condition entered the merge with
-  `pcd.has_colors() == False`. Fixed: every frame now gets an explicit
-  neutral-gray fallback color when it can't be camera-colored, so it always
-  has a colors array of the correct length before merging.
+"image + intrinsics found in time" branch of `flush()`, with no `else`.
+Frames that missed that condition entered the merge with
+`pcd.has_colors() == False`. Fixed: every frame now gets an explicit
+neutral-gray fallback color when it can't be camera-colored, so it always
+has a colors array of the correct length before merging.
 - Root cause 2: `_merge_chunk` combined clouds with `+=`/`+`. Open3D's
-  `PointCloud.__add__`/`__iadd__` clears color on the ENTIRE result if
-  either operand lacks a colors array -- so a single frame missing colors
-  (root cause 1) would wipe out coloring for everything merged after it,
-  which is exactly why the final mesh/cloud was totally colorless instead
-  of just patchy. Fixed: merging is now done via manual numpy
-  concatenation + explicit Vector3dVector assignment, which never invokes
-  Open3D's add operators and is therefore immune to this behavior.
+`PointCloud.__add__`/`__iadd__` clears color on the ENTIRE result if
+either operand lacks a colors array -- so a single frame missing colors
+(root cause 1) would wipe out coloring for everything merged after it,
+which is exactly why the final mesh/cloud was totally colorless instead
+of just patchy. Fixed: merging is now done via manual numpy
+concatenation + explicit Vector3dVector assignment, which never invokes
+Open3D's add operators and is therefore immune to this behavior.
 - Added a running/report count of frames colored from the camera vs.
-  frames that fell back to gray, printed at the end of the merge pass, so
-  a future regression is visible immediately as "N/M frames used fallback
-  gray" instead of resurfacing as silent total color loss.
+frames that fell back to gray, printed at the end of the merge pass, so
+a future regression is visible immediately as "N/M frames used fallback
+gray" instead of resurfacing as silent total color loss.
 
 REFACTOR NOTE (shared color-projection helpers):
 The camera-projection coloring math, the fallback-gray guarantee, the
@@ -67,10 +81,10 @@ reconstruction, so any remesh step downstream of it would destroy that
 color. `create_mesh()` is now always called with `remesh=False`.
 
 PATCH NOTE (defaults aligned to Bellhop GUI):
-`--pc_topic`, `--frame_stride`, and `--loop_closure_radius` now default to
-the same values the GUI's Color Mesh profile always sent (`/points`, `2`,
-and `3.0` respectively), so a bare CLI invocation with no flags now
-produces the exact same behavior as a GUI-launched run with no changes.
+`--pc_topic` and `--loop_closure_radius` now default to the same values
+the GUI's Color Mesh profile always sent (`/points` and `3.0`
+respectively), so a bare CLI invocation with no flags now produces the
+exact same behavior as a GUI-launched run with no changes.
 """
 
 from __future__ import annotations
@@ -99,7 +113,7 @@ from .shared.registration import (
     attach_view_rays_as_normals,
     estimate_geometric_normals_oriented,
     run_odom_anchored_registration,
-    select_registration_frames,
+    select_registration_frames_by_motion,
 )
 from .shared.ros_io import (
     TYPESTORE,
@@ -170,26 +184,22 @@ def _read_registration_data(
 ) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], dict[int, np.ndarray]]:
     """First pass: retain bounded, voxelized registration scans.
 
-    NOTE: frame_stride is intentionally NOT applied here. Striding is
-    applied exactly once, downstream, via
-    `registration.select_registration_frames()`, called from `run()`
-    before registration. Applying it here as well would silently compound
-    with that later selection (e.g. stride=4 here + stride=4 there == an
-    effective stride of 16), causing far fewer frames to survive than
-    --max_registration_frames would suggest. This function only enforces
-    --min_frame_points and a generous read-ahead cap derived from
-    --max_registration_frames so very large bags are still bounded.
+    NOTE: frame selection (motion gating + the odometry health check) is
+    intentionally NOT applied here. Selection now happens exactly once,
+    downstream, inside `run_odom_anchored_registration()` (for the 'local'
+    branch) or via `select_registration_frames_by_motion()` directly (for
+    the 'global' branch). This function only enforces --min_frame_points
+    and a generous read-ahead cap derived from --max_registration_frames,
+    so very large bags are still bounded. This cap now bounds RAW frames
+    read, not guaranteed SELECTED frames, since selection is motion-gated
+    rather than a fixed stride.
     """
     topics = [args.pc_topic] + ([args.odom_topic] if args.odom_topic else [])
 
     frames: list[tuple[int, o3d.geometry.PointCloud]] = []
     odom_data: dict[int, np.ndarray] = {}
 
-    stride = max(1, int(args.frame_stride))
-    max_registration_frames = max(0, int(args.max_registration_frames))
-    read_ahead_limit = (
-        max_registration_frames * stride if max_registration_frames else 0
-    )
+    read_ahead_limit = max(0, int(args.max_registration_frames)) if args.max_registration_frames else 0
 
     print(f"Reading registration frames: {bag_path}")
 
@@ -455,32 +465,35 @@ def run(args) -> None:
     if args.odom_topic and not odom_data:
         print("Warning: odom topic was set but no usable messages were found.")
 
-    selected_frames, _original_indices = select_registration_frames(
-        frames, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
-    )
-
-    print(
-        f"Coverage: frames selected = {len(selected_frames):,} / {len(frames):,} "
-        f"(stride={args.frame_stride}, max={args.max_registration_frames})."
-    )
-    del frames
-    gc.collect()
-
     if frame_mode == "global":
         print(
             "Point cloud already in a global/fixed frame: skipping ICP/pose-graph "
             "registration and per-frame transform application; streaming, "
             "filtering, downsampling, colouring, and merging directly."
         )
+        selected_frames, _original_indices = select_registration_frames_by_motion(
+            frames,
+            odom_data,
+            min_move_distance=args.min_move_distance,
+            min_rotation_angle_deg=args.min_rotation_angle_deg,
+            max_registration_frames=args.max_registration_frames,
+            odom_max_latency_ns=int(args.odom_max_latency * 1e9),
+        )
+        print(
+            f"Coverage: frames selected = {len(selected_frames):,} / {len(frames):,} "
+            f"(min_move_distance={args.min_move_distance}m, "
+            f"min_rotation_angle_deg={args.min_rotation_angle_deg}deg, "
+            f"max={args.max_registration_frames})."
+        )
         poses: dict[int, np.ndarray] = {
             timestamp: np.eye(4, dtype=np.float64) for timestamp, _ in selected_frames
         }
         print(f"Coverage: frames with valid pose = {len(poses):,} (identity; no registration needed).")
     else:
-        print(f"Registering {len(selected_frames)} bounded point-cloud frames (odom-anchored)...")
-        poses, _stats = run_odom_anchored_registration(selected_frames, odom_data, args)
+        print(f"Registering up to {len(frames)} raw point-cloud frames (odom-anchored)...")
+        poses, _stats = run_odom_anchored_registration(frames, odom_data, args)
 
-    del selected_frames
+    del frames
     gc.collect()
 
     if not poses:
@@ -576,7 +589,6 @@ def build_parser(sub):
             "override when a bag's frame_id is missing, wrong, or empty."
         ),
     )
-
     parser.add_argument("--camera_topic", required=True)
     parser.add_argument("--camera_info_topic", required=True)
 
@@ -589,16 +601,35 @@ def build_parser(sub):
     parser.add_argument("--min_frame_points", type=int, default=100)
 
     parser.add_argument(
-        "--frame_stride",
-        type=int,
-        default=2,
-        help="Use every Nth cloud for registration and colouring.",
+        "--min_move_distance",
+        type=float,
+        default=0.10,
+        help="Minimum translation (m), relative to the last KEPT registration frame's "
+        "odometry pose, required to keep a new frame. Replaces the old index-based "
+        "--frame_stride: odom is the primary pose source, so a frame that hasn't moved "
+        "(or turned) adds no new spatial coverage and is skipped instead of thinning "
+        "purely by message count. A frame is kept if EITHER this OR "
+        "--min_rotation_angle_deg is satisfied. Set to 0 to disable this half of the gate.",
+    )
+    parser.add_argument(
+        "--min_rotation_angle_deg",
+        type=float,
+        default=5.0,
+        help="Minimum rotation (deg), relative to the last KEPT registration frame's "
+        "odometry pose, required to keep a new frame (OR'd with --min_move_distance). "
+        "Lets a robot that spins in place without translating still accumulate new "
+        "frames to cover the swept field of view. Set to 0 to disable this half of "
+        "the gate.",
     )
     parser.add_argument(
         "--max_registration_frames",
         type=int,
         default=0,
-        help="Maximum registration frames; 0 means unlimited.",
+        help=(
+            "Maximum registration frames (0 means unlimited). Bounds BOTH raw "
+            "frames read ahead of time AND the number of frames kept after the "
+            "motion gate and the odometry health check, applied in temporal order."
+        ),
     )
     parser.add_argument(
         "--merge_chunk_frames",
@@ -607,6 +638,27 @@ def build_parser(sub):
         help="Frames merged before each voxel reduction.",
     )
     parser.add_argument("--odom_max_latency", type=float, default=0.5)
+
+    parser.add_argument(
+        "--disable_odom_health_check",
+        action="store_true",
+        default=False,
+        help="Disable the automatic odometry health check that truncates registration "
+        "at the first detected tracking loss/teleport (implied speed or rotation rate "
+        "far above the bag's own 95th-percentile baseline). Enabled by default so a "
+        "lost-odom segment cannot silently skew the output. The segment after a "
+        "detected loss is never auto-spliced back in.",
+    )
+    parser.add_argument(
+        "--odom_loss_speed_multiplier",
+        type=float,
+        default=6.0,
+        help="Sensitivity of the odometry health check: a consecutive odometry sample "
+        "pair is flagged as a tracking loss/teleport if its implied linear speed OR "
+        "angular rate exceeds this multiplier times the bag's own 95th-percentile "
+        "baseline. Lower = more sensitive (may false-positive on genuinely fast "
+        "motion); higher = less sensitive. Ignored if --disable_odom_health_check is set.",
+    )
 
     parser.add_argument(
         "--enable_icp_refinement",
@@ -652,7 +704,6 @@ def build_parser(sub):
         default=100,
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
-
     parser.add_argument(
         "--poisson_depth",
         type=int,

@@ -59,7 +59,7 @@ PERF NOTE (OcTree insertion speedup): step [2/6] previously called
 `obstacle_tree.insertPointCloud(points, sensor_origin, -1.0)` once per
 frame with no other options set. Profiling on dense LiDAR bags (e.g.
 Ouster, ~65k-131k pts/frame) showed this step dominating total runtime,
-for three compounding reasons, all fixed below without changing the
+for three compounding reasons, addressed below without changing the
 occupancy semantics used by the validated hybrid method:
 
 1. Every single `insertPointCloud()` call recomputed inner-node occupancy
@@ -74,26 +74,83 @@ occupancy semantics used by the validated hybrid method:
 2. Full-resolution points (not yet voxel-downsampled) were ray-cast into
    the tree every frame -- the existing `--voxel_size` downsample only
    ran *after* insertion, on the copy kept for ground/obstacle
-   separation. `--octree_discretize` (default: on) sets `discretize=True`,
-   which snaps the scan onto the octree's own voxel grid before casting
-   rays, collapsing many same-voxel points into one ray. This changes
-   which exact points contribute to each ray (occupied nodes still take
+   separation. `--octree_discretize` sets `discretize=True`, which snaps
+   the scan onto the octree's own voxel grid before casting rays,
+   collapsing many same-voxel points into one ray. This changes which
+   exact points contribute to each ray (occupied nodes still take
    precedence over free ones, per OctoMap's `computeDiscreteUpdate()`),
-   which is a deliberate accuracy/speed tradeoff now enabled by default;
-   pass `--no-octree_discretize`-equivalent behavior is not available as
-   a flag but the operator may set `--octree_discretize` explicitly if
-   they need to reason about it.
+   which is a deliberate accuracy/speed tradeoff.
 3. Every ray was previously cast the complete beam length (`maxrange=-1.0`),
    so distant returns cost proportionally more voxel traversals.
    `--octree_max_range` (default: 40.0 m) now caps beam length by default
    for the ground/obstacle band this pipeline maps; pass a larger value
    (or -1.0 for unlimited) if far returns are needed.
 
-These defaults (`--octree_lazy_eval` on, `--octree_discretize` on,
-`--octree_max_range` 40.0) match the Bellhop GUI's OG Map profile
-defaults, so a run launched from the GUI with no changes and one
-launched from the bare CLI with no flags now produce identical
-`docker run` commands.
+These defaults (`--octree_lazy_eval` on, `--octree_max_range` 40.0) match
+the Bellhop GUI's OG Map profile defaults, so a run launched from the GUI
+with no changes and one launched from the bare CLI with no flags now
+produce identical `docker run` commands.
+
+BUGFIX (--octree_discretize now defaults OFF -- upstream pyoctomap crash):
+Running with `--octree_discretize` (previously the default) crashes
+INSIDE the installed `pyoctomap` binding, not in this file, whenever
+`insertPointCloud(..., discretize=True)` is called:
+
+    File "pyoctomap/octree.pyx", line 904, in OcTree.insertPointCloud
+    File "pyoctomap/octree.pyx", line 855, in OcTree._build_pointcloud_and_insert
+    File "pyoctomap/octree.pyx", line 827, in OcTree._discretizePointCloud
+    File "pyoctomap/octree.pyx", line 140, in OcTree.coordToKeyChecked
+    AttributeError: 'pyoctomap.octree_base.OcTreeKey' object has no
+    attribute 'thisptr'
+
+This is `_discretizePointCloud`'s internal `OcTreeKey` construction
+skipping the `__cinit__` path that allocates the wrapped C++ pointer
+(`thisptr`), so `coordToKeyChecked` receives a half-initialized key and
+raises `AttributeError` on every single insertion. It is 100% reproducible
+on the `discretize=True` code path with the pyoctomap build currently
+pinned in this image, and it is not something this pipeline's own code
+can work around other than by not exercising that path. `--octree_discretize`
+now therefore defaults to **off** (`discretize=False`), which routes
+insertion through the unaffected, per-point ray-casting path instead.
+The flag itself is left in place -- and still does exactly what its help
+text says -- in case a future pyoctomap release fixes the underlying bug
+and an operator wants to re-enable the discretization speedup; passing
+`--octree_discretize` explicitly re-enables it (and will still crash
+until that upstream bug is fixed). `run()` below also logs a loud warning
+if it is ever turned on, so a re-enabled flag never fails silently.
+
+PERF NOTE (_separate_ground_and_obstacles: vectorized nearest-neighbor
+remap): this function estimates surface normals on a voxel-downsampled,
+noise-averaged copy of the merged cloud, then has every FULL-RESOLUTION
+point borrow its nearest downsampled neighbor's normal before the
+ground/obstacle slope test. That two-step design is intentional -- it
+smooths out per-point LiDAR noise before classification -- and is left
+unchanged here.
+
+What changed is *how* the nearest-neighbor lookup is computed. It
+previously called Open3D's `KDTreeFlann.search_knn_vector_3d()` once per
+point inside a Python generator:
+
+    nearest_indices = np.fromiter(
+        (tree.search_knn_vector_3d(point, 1)[1][0] for point in points),
+        dtype=np.int64, count=len(points),
+    )
+
+`_separate_ground_and_obstacles()` is called exactly once per run, on
+`full_cloud` -- the vstack of every processed frame across the *entire*
+bag, not a single frame -- so `points` here can be tens of millions of
+entries. A Python-level function call per point at that scale dominates
+this pipeline's total runtime on large bags.
+
+Fixed by building a `scipy.spatial.cKDTree` from the same downsampled
+points and issuing a single batched `cKDTree.query(points, k=1)` call.
+This computes the *identical* Euclidean 1-nearest-neighbor lookup Open3D's
+`search_knn_vector_3d` performed -- same tree contents, same query points,
+same distance metric -- just as one vectorized C call instead of N Python
+calls. Output indices (and therefore the borrowed normals and the
+resulting ground/obstacle split) are unchanged; only the wall-clock cost
+of computing them drops. `scipy` is already a hard dependency
+(requirements.txt: `scipy>=1.10.0`), so no new dependency is introduced.
 """
 
 from __future__ import annotations
@@ -113,6 +170,7 @@ from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 from scipy.interpolate import griddata
 from scipy.ndimage import binary_closing, label
+from scipy.spatial import cKDTree
 
 from .shared.preflight import check_topics
 from .shared.ros_io import (
@@ -163,16 +221,16 @@ def _separate_ground_and_obstacles(
         return np.empty((0, 3)), np.asarray(cloud.points)
 
     points = np.asarray(cloud.points)
-    tree = o3d.geometry.KDTreeFlann(downsampled)
+    downsampled_points = np.asarray(downsampled.points)
 
-    nearest_indices = np.fromiter(
-        (
-            tree.search_knn_vector_3d(point, 1)[1][0]
-            for point in points
-        ),
-        dtype=np.int64,
-        count=len(points),
-    )
+    # PERF FIX: a single batched cKDTree query replaces the previous
+    # per-point Open3D KDTreeFlann.search_knn_vector_3d() loop. Same
+    # nearest-neighbor result (same tree contents, same query points, same
+    # Euclidean metric), computed once for the entire `points` array
+    # instead of once per point -- see the module-level PERF NOTE above.
+    tree = cKDTree(downsampled_points)
+    _distances, nearest_indices = tree.query(points, k=1)
+    nearest_indices = nearest_indices.astype(np.int64)
 
     normals = np.asarray(downsampled.normals)[nearest_indices]
 
@@ -236,7 +294,6 @@ def _build_ground_height_map(
         (grid_y[valid], grid_x[valid]),
         ground_points[valid, 2],
     )
-
     np.add.at(
         counts,
         (grid_y[valid], grid_x[valid]),
@@ -464,6 +521,7 @@ def run(args) -> None:
         bag_path,
         [args.pc_topic, args.odom_topic],
     )
+
     if missing_topics:
         sys.exit(f"Error: Required topics not found: {missing_topics}")
 
@@ -520,6 +578,21 @@ def run(args) -> None:
     odom_max_latency_ns = int(args.odom_max_latency * 1e9)
 
     logger.info("Loaded %d odometry poses.", len(odom_data))
+
+    # BUGFIX: --octree_discretize now defaults to off (see module
+    # docstring "BUGFIX (--octree_discretize now defaults OFF...)"). If an
+    # operator explicitly re-enables it, warn loudly on every run so a
+    # future crash inside pyoctomap's _discretizePointCloud is never a
+    # surprise -- this flag is known to crash with the pyoctomap build
+    # pinned in this image.
+    if args.octree_discretize:
+        logger.warning(
+            "--octree_discretize is enabled. This is known to crash inside "
+            "the pinned pyoctomap build's insertPointCloud(discretize=True) "
+            "path with: AttributeError: 'OcTreeKey' object has no attribute "
+            "'thisptr'. If insertion fails with that error, re-run with "
+            "--no-octree_discretize (the default)."
+        )
 
     logger.info(
         "[2/6] Building 3D OcTree (octree_res=%s m, lazy_eval=%s, "
@@ -618,10 +691,11 @@ def run(args) -> None:
                 # PERF: lazy_eval defers inner-node occupancy recomputation
                 # until updateInnerOccupancy() is called once below (see
                 # PERF NOTE at module top) instead of on every frame;
-                # discretize snaps the scan onto the octree's own
-                # voxel grid before ray casting to avoid redundant rays
-                # from a still-full-resolution frame; max_range caps beam
-                # length (40 m by default; pass -1.0 for unlimited).
+                # discretize (off by default -- see BUGFIX note at module
+                # top) would snap the scan onto the octree's own voxel
+                # grid before ray casting to avoid redundant rays from a
+                # still-full-resolution frame; max_range caps beam length
+                # (40 m by default; pass -1.0 for unlimited).
                 obstacle_tree.insertPointCloud(
                     points,
                     sensor_origin,
@@ -781,6 +855,7 @@ def build_parser(sub):
         "og_map",
         help="ROS 2 bag -> Nav2 occupancy grid (.pgm + .yaml)",
     )
+
     parser.add_argument("input_bag")
     parser.add_argument("output_path")
 
@@ -792,6 +867,7 @@ def build_parser(sub):
         "--odom_topic",
         default="/odom",
     )
+
     parser.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -828,6 +904,7 @@ def build_parser(sub):
         default=0,
         help="Maximum selected PointCloud2 frames; 0 means all.",
     )
+
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min_cluster_size", type=int, default=20)
     parser.add_argument("--closing_iters", type=int, default=1)
@@ -839,8 +916,10 @@ def build_parser(sub):
     )
 
     # PERF: flags controlling OcTree insertion (step [2/6]). See the
-    # "PERF NOTE" in this file's module docstring for why each exists.
-    # Defaults below match the Bellhop GUI's OG Map profile exactly.
+    # "PERF NOTE" and "BUGFIX" sections in this file's module docstring
+    # for why each exists and, for --octree_discretize, why its default
+    # changed. Defaults below match the Bellhop GUI's OG Map profile
+    # exactly.
     parser.add_argument(
         "--octree_max_range",
         type=float,
@@ -852,6 +931,7 @@ def build_parser(sub):
             "(unlimited) if far returns are needed."
         ),
     )
+
     parser.add_argument(
         "--octree_lazy_eval",
         action="store_true",
@@ -870,23 +950,41 @@ def build_parser(sub):
         action="store_false",
         help="Disable --octree_lazy_eval (recompute inner nodes every frame).",
     )
+
+    # BUGFIX: default flipped from True to False. Enabling this flag
+    # crashes on every frame inside the pinned pyoctomap build's
+    # insertPointCloud(discretize=True) -> _discretizePointCloud ->
+    # coordToKeyChecked path with "AttributeError: 'OcTreeKey' object has
+    # no attribute 'thisptr'" -- an upstream bug in pyoctomap's Cython
+    # OcTreeKey construction, not in this pipeline. See the "BUGFIX
+    # (--octree_discretize now defaults OFF...)" note in the module
+    # docstring for full detail. The flag is kept (rather than removed)
+    # so it can be re-enabled if/when that upstream bug is fixed.
     parser.add_argument(
         "--octree_discretize",
         action="store_true",
-        default=True,
+        default=False,
         help=(
             "Snap each frame onto the OcTree's own voxel grid before ray "
-            "casting (default: on). Collapses multiple same-voxel "
-            "points into one ray per frame, which speeds up insertion on "
-            "dense point clouds at the cost of using a discretized "
-            "approximation of each frame rather than every raw point."
+            "casting (default: OFF -- the currently pinned pyoctomap "
+            "build crashes with AttributeError: 'OcTreeKey' object has no "
+            "attribute 'thisptr' when this is enabled; see this file's "
+            "module docstring). When usable, this collapses multiple "
+            "same-voxel points into one ray per frame, speeding up "
+            "insertion on dense point clouds at the cost of using a "
+            "discretized approximation of each frame rather than every "
+            "raw point."
         ),
     )
     parser.add_argument(
         "--no-octree_discretize",
         dest="octree_discretize",
         action="store_false",
-        help="Disable --octree_discretize (ray-cast every raw point).",
+        help=(
+            "Explicitly disable --octree_discretize (ray-cast every raw "
+            "point). This is already the default; the flag is kept for "
+            "backward-compatible scripts/commands that still pass it."
+        ),
     )
 
     parser.set_defaults(func=run)

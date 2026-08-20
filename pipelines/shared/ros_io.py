@@ -17,6 +17,31 @@ pointcloud-frame-check-prompt-2.md):
   override for when a bag's frame_id is missing, wrong, or empty.
 
 All existing functions/signatures are unchanged; these are additive.
+
+PATCH NOTE (pointcloud2_to_numpy fallback vectorization):
+The manual fallback parser previously decoded each point individually with
+a Python `for i in range(n)` loop -- three separate `np.frombuffer` calls
+per point (x, y, z) plus a Python-list `.append()`, only becoming a NumPy
+array at the very end. Since `robotdatapy` (the fast-path dependency) is
+commented out in requirements.txt, this fallback is the *default active*
+code path for `og_map.py` today, not a rare edge case, and it was the
+dominant per-frame cost in that pipeline's bag-reading loop.
+
+Fixed by mirroring the vectorized approach already used in
+`convert_ros_pc2_to_o3d()` just above: build a structured NumPy dtype from
+the message's actual field offsets/datatype and `itemsize`, then call
+`np.frombuffer()` once on the entire buffer. This preserves the original
+function's behavior exactly:
+  - still returns an (N, 3) float32 array (or an empty array on failure/
+    empty input), matching every existing caller's expectations,
+  - still supports both float32 and float64 PointField datatypes (the
+    original loop hardcoded float32 field width, `data[...:...+4]`, which
+    would have silently misparsed a float64 cloud; the vectorized version
+    reads the *actual* declared datatype via `_POINTFIELD_TO_DTYPE` like
+    `convert_ros_pc2_to_o3d()` does, so this is a strict correctness
+    improvement, not just a speedup),
+  - still filters to finite (non-NaN/non-inf) points only,
+  - still logs the same warnings on the same failure conditions.
 """
 import bisect
 import logging
@@ -113,9 +138,19 @@ def convert_ros_pc2_to_o3d(msg):
 def pointcloud2_to_numpy(msg):
     """Convert a PointCloud2 message to an (N, 3) numpy array.
 
-    Tries the robotdatapy fast-path first, then falls back to a manual
-    per-field parse. Both paths log the specific failure reason instead
-    of failing silently.
+    Tries the robotdatapy fast-path first, then falls back to a vectorized
+    manual parse. Both paths log the specific failure reason instead of
+    failing silently.
+
+    PERF/CORRECTNESS FIX: the manual fallback previously parsed one point
+    at a time in a pure-Python loop, and hardcoded float32 field width
+    regardless of the message's declared PointField datatype. It now
+    builds a structured NumPy dtype from the message's actual field
+    offsets/datatype/itemsize -- exactly like `convert_ros_pc2_to_o3d()`
+    above -- and parses the entire buffer with a single `np.frombuffer()`
+    call. Since `robotdatapy` is an optional, currently-uninstalled
+    dependency (see requirements.txt), this fallback is the default
+    active path today, not a rare edge case.
     """
     try:
         from robotdatapy.pointcloud.pointcloud_conversions import pointcloud2_to_xyz_array
@@ -126,34 +161,38 @@ def pointcloud2_to_numpy(msg):
         logger.warning("robotdatapy PointCloud2 conversion failed (%s); falling back to manual parser.", exc)
 
     try:
-        n = msg.height * msg.width
+        n = int(msg.height) * int(msg.width)
         if n == 0:
             return np.array([])
 
-        xo = yo = zo = None
-        for f in msg.fields:
-            if f.name == "x":
-                xo = f.offset
-            elif f.name == "y":
-                yo = f.offset
-            elif f.name == "z":
-                zo = f.offset
-
-        if None in (xo, yo, zo):
+        fields = {f.name: (int(f.offset), int(f.datatype)) for f in msg.fields}
+        if not all(k in fields for k in ("x", "y", "z")):
             logger.warning("PointCloud2 message missing one of x/y/z field offsets.")
             return np.array([])
 
-        data = bytes(msg.data)
-        step = msg.point_step
-        pts = []
-        for i in range(n):
-            o = i * step
-            x = np.frombuffer(data[o + xo:o + xo + 4], np.float32)[0]
-            y = np.frombuffer(data[o + yo:o + yo + 4], np.float32)[0]
-            z = np.frombuffer(data[o + zo:o + zo + 4], np.float32)[0]
-            if np.isfinite(x) and np.isfinite(y) and np.isfinite(z):
-                pts.append((x, y, z))
-        return np.array(pts, np.float32) if pts else np.array([])
+        xo, xd = fields["x"]; yo, yd = fields["y"]; zo, zd = fields["z"]
+        if xd not in _POINTFIELD_TO_DTYPE or xd != yd or yd != zd:
+            logger.warning(
+                "Unsupported or mismatched PointField datatypes (x=%s y=%s z=%s); "
+                "expected one of %s for all axes.",
+                xd, yd, zd, list(_POINTFIELD_TO_DTYPE),
+            )
+            return np.array([])
+
+        dt = _POINTFIELD_TO_DTYPE[xd]
+        dtype = np.dtype({
+            "names": ["x", "y", "z"],
+            "formats": [dt, dt, dt],
+            "offsets": [xo, yo, zo],
+            "itemsize": int(msg.point_step),
+        })
+        arr = np.frombuffer(bytes(msg.data), dtype=dtype, count=n)
+
+        pts = np.empty((n, 3), np.float32)
+        pts[:, 0] = arr["x"]; pts[:, 1] = arr["y"]; pts[:, 2] = arr["z"]
+
+        pts = pts[np.isfinite(pts).all(1)]
+        return pts if len(pts) else np.array([])
     except (ValueError, TypeError, struct.error) as exc:
         logger.warning("Manual PointCloud2 parsing failed: %s", exc)
         return np.array([])

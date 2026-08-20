@@ -10,20 +10,34 @@ to `mesh.py` and `color_mesh.py`, since all three pipelines shared the same
 ICP-primary registration pattern via `shared/registration.py`:
 
 - The point cloud's frame_id is detected (or overridden via
-  --pc_frame_mode) and classified as 'global' (already in a fixed frame:
-  odom/map/world) or 'local' (a moving sensor/base frame).
+--pc_frame_mode) and classified as 'global' (already in a fixed frame:
+odom/map/world) or 'local' (a moving sensor/base frame).
 - 'local' frames are registered via `run_odom_anchored_registration()`,
-  which makes timestamped odometry the PRIMARY pose source and demotes ICP
-  to an optional, strongly-gated local refinement (--enable_icp_refinement,
-  default off). Frames are only ever dropped for lacking odometry coverage,
-  never for failing an ICP fitness check.
+which makes timestamped odometry the PRIMARY pose source and demotes ICP
+to an optional, strongly-gated local refinement (--enable_icp_refinement,
+default off). Frames are only ever dropped for lacking odometry coverage,
+never for failing an ICP fitness check.
 - 'global' frames skip registration entirely: an identity transform is
-  used (a correct no-op), so frames are streamed/filtered/downsampled/
-  merged directly with no ICP/pose-graph step. Odom (if provided) is still
-  used for view-ray normal orientation.
+used (a correct no-op), so frames are streamed/filtered/downsampled/
+merged directly with no ICP/pose-graph step. Odom (if provided) is still
+used for view-ray normal orientation.
 - CAVEAT: the frame check only detects whether the cloud is already in a
-  fixed/global frame -- it does NOT correct for a real sensor-to-base_link
-  extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
+fixed/global frame -- it does NOT correct for a real sensor-to-base_link
+extrinsic offset (lever arm). See `ros_io.classify_frame_mode` docstring.
+
+PATCH NOTE (motion-gated frame selection + odometry health check):
+Ported from `mesh.py`/`color_mesh.py`: `--frame_stride` has been removed
+in favor of motion-gated selection. `--min_move_distance`/
+`--min_rotation_angle_deg` now keep a frame only if it has actually
+moved/turned relative to the last KEPT frame's odometry pose (OR'd
+together), instead of thinning purely by message count. An odometry
+health check now runs automatically (unless --disable_odom_health_check)
+and truncates registration at the first detected tracking loss/teleport
+in the raw odometry stream, before any frame is selected -- both changes
+are handled internally by `run_odom_anchored_registration()` for the
+'local' branch, and via `select_registration_frames_by_motion()` directly
+for the 'global' branch. See `shared/registration.py` for the full
+design.
 
 FIX (--remesh/--no-remesh flag mismatch):
 Previously this pipeline registered the remesh-disable flag as
@@ -72,11 +86,10 @@ redefined locally, so a future fix to the chunking logic only needs to be
 made once.
 
 PATCH NOTE (defaults aligned to Bellhop GUI):
-`--pc_topic`, `--workers`, `--frame_stride`, and `--loop_closure_radius`
-now default to the same values the GUI's Gazebo World profile always
-sent (`/points`, `1`, `2`, and `3.0` respectively), so a bare CLI
-invocation with no flags now produces the exact same behavior as a
-GUI-launched run with no changes.
+`--pc_topic`, `--workers`, and `--loop_closure_radius` now default to the
+same values the GUI's Gazebo World profile always sent (`/points`, `1`,
+and `3.0` respectively), so a bare CLI invocation with no flags now
+produces the exact same behavior as a GUI-launched run with no changes.
 """
 
 import argparse
@@ -96,7 +109,7 @@ from .shared.registration import (
     attach_view_rays_as_normals,
     estimate_geometric_normals_oriented,
     run_odom_anchored_registration,
-    select_registration_frames,
+    select_registration_frames_by_motion,
 )
 from .shared.ros_io import (
     TYPESTORE,
@@ -116,7 +129,7 @@ _CONFIG_TEMPLATE = """<?xml version="1.0"?>
   <sdf version="1.6">model.sdf</sdf>
   <author>
     <name>bellhop</name>
-    <email>bag_to_gazebo@auto@generated.com</email>
+    <email>bag_to_gazebo@auto-generated.com</email>
   </author>
   <description>3D environment mesh generated from a ROS 2 bag file.</description>
 </model>
@@ -227,7 +240,7 @@ def run(args) -> None:
     if missing:
         sys.exit(
             f"Error: Required topics missing from bag: {missing}\n"
-            "Check topic names with: ros2 bag info <bag>"
+            "Check topic names with: ros2 bag info <bag_path>"
         )
 
     # -- Read bag ------------------------------------------------------------
@@ -259,17 +272,6 @@ def run(args) -> None:
 
     print(f"Coverage: frames read = {len(pointclouds):,}, odom poses = {len(odom_data):,}.")
 
-    selected_frames, _original_indices = select_registration_frames(
-        pointclouds, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
-    )
-
-    print(
-        f"Coverage: frames selected = {len(selected_frames):,} / {len(pointclouds):,} "
-        f"(stride={args.frame_stride}, max={args.max_registration_frames})."
-    )
-    del pointclouds
-    gc.collect()
-
     # -- Registration ---------------------------------------------------------
     if frame_mode == "global":
         print(
@@ -277,13 +279,28 @@ def run(args) -> None:
             "registration and per-frame transform application; streaming, "
             "filtering, downsampling, and merging directly."
         )
+        selected_frames, _original_indices = select_registration_frames_by_motion(
+            pointclouds,
+            odom_data,
+            min_move_distance=args.min_move_distance,
+            min_rotation_angle_deg=args.min_rotation_angle_deg,
+            max_registration_frames=args.max_registration_frames,
+            odom_max_latency_ns=int(args.odom_max_latency * 1e9),
+        )
+        print(
+            f"Coverage: frames selected = {len(selected_frames):,} / {len(pointclouds):,} "
+            f"(min_move_distance={args.min_move_distance}m, "
+            f"min_rotation_angle_deg={args.min_rotation_angle_deg}deg, "
+            f"max={args.max_registration_frames})."
+        )
         pose_by_timestamp: dict[int, np.ndarray] = {
             timestamp: np.eye(4, dtype=np.float64) for timestamp, _ in selected_frames
         }
+        del selected_frames
         print(f"Coverage: frames with valid pose = {len(pose_by_timestamp):,} (identity; no registration needed).")
     else:
-        print(f"Registering {len(selected_frames)} point-cloud frames (odom-anchored)...")
-        pose_by_timestamp, _stats = run_odom_anchored_registration(selected_frames, odom_data, args)
+        print(f"Registering up to {len(pointclouds)} raw point-cloud frames (odom-anchored)...")
+        pose_by_timestamp, _stats = run_odom_anchored_registration(pointclouds, odom_data, args)
 
     if not pose_by_timestamp:
         sys.exit("Error: Registration produced no usable poses.")
@@ -301,13 +318,19 @@ def run(args) -> None:
     # instead of growing toward O(n^2) as an ever-larger, never-reduced
     # cloud gets re-concatenated on every iteration. `--merge_chunk_frames`
     # now actually does what its help text always described.
+    #
+    # NOTE: the merge loop below iterates over the FULL raw `pointclouds`
+    # list (not a separately-tracked "selected" list) and relies on
+    # `pose_by_timestamp.get(timestamp)` to skip any frame that motion
+    # gating, the odometry health check, or odometry-coverage filtering
+    # excluded -- those frames simply have no entry in `pose_by_timestamp`.
     print("Merging registered frames (chunked, bounded memory)...")
     pcd_combined = o3d.geometry.PointCloud()
     chunk: list[o3d.geometry.PointCloud] = []
     chunk_size = max(1, int(args.merge_chunk_frames))
     merged_frame_count = 0
 
-    for timestamp, pcd_raw in tqdm(selected_frames, desc="Merging"):
+    for timestamp, pcd_raw in tqdm(pointclouds, desc="Merging"):
         transform_world = pose_by_timestamp.get(timestamp)
         if transform_world is None:
             continue
@@ -332,7 +355,7 @@ def run(args) -> None:
     pcd_combined = merge_chunk(pcd_combined, chunk, args.voxel_size)
 
     print(f"Merge: {merged_frame_count:,} frame(s) actually merged into the combined cloud.")
-    del selected_frames, pose_by_timestamp
+    del pointclouds, pose_by_timestamp
     gc.collect()
 
     if not len(pcd_combined.points):
@@ -394,13 +417,13 @@ def build_parser(sub):
 
     # Topics
     p.add_argument("--pc_topic", default="/points",
-                   help="PointCloud2 topic (default: /points).")
+                    help="PointCloud2 topic (default: /points).")
     p.add_argument("--odom_topic", default=None,
-                   help=(
-                       "Odometry topic (nav_msgs/Odometry). Required unless the "
-                       "point cloud is already published in a global/fixed frame "
-                       "(see --pc_frame_mode)."
-                   ))
+                    help=(
+                        "Odometry topic (nav_msgs/Odometry). Required unless the "
+                        "point cloud is already published in a global/fixed frame "
+                        "(see --pc_frame_mode)."
+                    ))
     p.add_argument(
         "--pc_frame_mode",
         choices=["auto", "global", "local"],
@@ -416,13 +439,72 @@ def build_parser(sub):
 
     # Gazebo
     p.add_argument("--model_name", default="bag_environment",
-                   help="Gazebo model name (default: bag_environment).")
+                    help="Gazebo model name (default: bag_environment).")
     p.add_argument("--gazebo_material", default="Gazebo/Grey",
-                   help="Gazebo material (e.g. Gazebo/White, Gazebo/Wood).")
+                    help="Gazebo material (e.g. Gazebo/White, Gazebo/Wood).")
 
     # Registration
     p.add_argument("--voxel_size", type=float, default=0.05)
     p.add_argument("--odom_max_latency", type=float, default=0.5)
+
+    p.add_argument(
+        "--min_move_distance",
+        type=float,
+        default=0.10,
+        help="Minimum translation (m), relative to the last KEPT registration frame's "
+        "odometry pose, required to keep a new frame. Replaces the old index-based "
+        "--frame_stride: odom is the primary pose source, so a frame that hasn't moved "
+        "(or turned) adds no new spatial coverage and is skipped instead of thinning "
+        "purely by message count. A frame is kept if EITHER this OR "
+        "--min_rotation_angle_deg is satisfied. Set to 0 to disable this half of the gate.",
+    )
+    p.add_argument(
+        "--min_rotation_angle_deg",
+        type=float,
+        default=5.0,
+        help="Minimum rotation (deg), relative to the last KEPT registration frame's "
+        "odometry pose, required to keep a new frame (OR'd with --min_move_distance). "
+        "Lets a robot that spins in place without translating still accumulate new "
+        "frames to cover the swept field of view. Set to 0 to disable this half of "
+        "the gate.",
+    )
+    p.add_argument(
+        "--max_registration_frames", type=int, default=0,
+        help=(
+            "Cap total frames used for registration (0 = all). Bounds BOTH raw "
+            "frames read ahead of time AND the number of frames kept after the "
+            "motion gate and the odometry health check, applied in temporal order."
+        ))
+    p.add_argument(
+        "--merge_chunk_frames", type=int, default=16,
+        help=(
+            "Frames merged per batch before each voxel reduction in the "
+            "streaming merge pass (default 16). Previously accepted but "
+            "unused by this pipeline's merge loop; now actually controls "
+            "how often the accumulated cloud is voxel-downsampled during "
+            "merging."
+        ))
+
+    p.add_argument(
+        "--disable_odom_health_check",
+        action="store_true",
+        default=False,
+        help="Disable the automatic odometry health check that truncates registration "
+        "at the first detected tracking loss/teleport (implied speed or rotation rate "
+        "far above the bag's own 95th-percentile baseline). Enabled by default so a "
+        "lost-odom segment cannot silently skew the output. The segment after a "
+        "detected loss is never auto-spliced back in.",
+    )
+    p.add_argument(
+        "--odom_loss_speed_multiplier",
+        type=float,
+        default=6.0,
+        help="Sensitivity of the odometry health check: a consecutive odometry sample "
+        "pair is flagged as a tracking loss/teleport if its implied linear speed OR "
+        "angular rate exceeds this multiplier times the bag's own 95th-percentile "
+        "baseline. Lower = more sensitive (may false-positive on genuinely fast "
+        "motion); higher = less sensitive. Ignored if --disable_odom_health_check is set.",
+    )
 
     p.add_argument(
         "--enable_icp_refinement",
@@ -458,30 +540,16 @@ def build_parser(sub):
         "--loop_closure_temporal_window", type=int, default=100,
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
-    p.add_argument("--frame_stride", type=int, default=2,
-                   help="Process every Nth frame.")
-    p.add_argument("--max_registration_frames", type=int, default=0,
-                   help="Cap total frames used for registration (0 = all).")
-    p.add_argument(
-        "--merge_chunk_frames", type=int, default=16,
-        help=(
-            "Frames merged per batch before each voxel reduction in the "
-            "streaming merge pass (default 16). Previously accepted but "
-            "unused by this pipeline's merge loop; now actually controls "
-            "how often the accumulated cloud is voxel-downsampled during "
-            "merging."
-        ),
-    )
 
     # Reconstruction
     p.add_argument("--poisson_depth", type=int, default=0,
-                   help="Poisson depth (0 = auto).")
+                    help="Poisson depth (0 = auto).")
     p.add_argument("--min_density_percentile", type=float, default=1.0,
-                   help="Bottom %% of Poisson vertex densities to trim (default 1.0).")
+                    help="Bottom %% of Poisson vertex densities to trim (default 1.0).")
     p.add_argument("--distance_multiplier", type=float, default=3.0,
-                   help="Adaptive vertex distance trim multiplier (default 3.0).")
+                    help="Adaptive vertex distance trim multiplier (default 3.0).")
     p.add_argument("--max_vertex_distance", type=float, default=0.0,
-                   help="Hard cap on vertex distance (m); 0 = disabled.")
+                    help="Hard cap on vertex distance (m); 0 = disabled.")
     # FIX: previously registered as two separate manual flags,
     # `--remesh` (store_true) and `--no_remesh` (dest="remesh",
     # store_false, underscore). gui.py always emits the hyphenated
@@ -499,13 +567,13 @@ def build_parser(sub):
         help="Run isotropic remesh + smooth after Poisson (default: on).",
     )
     p.add_argument("--remesh_smooth_iterations", type=int, default=5,
-                   help="Laplacian smooth iterations during remesh (default 5).")
+                    help="Laplacian smooth iterations during remesh (default 5).")
     p.add_argument("--decimate_target", type=float, default=None,
-                   help="<=1.0 = fraction of triangles; >1 = absolute count; None = skip.")
+                    help="<=1.0 = fraction of triangles; >1 = absolute count; None = skip.")
     p.add_argument("--curvature_percentile", type=float, default=80.0,
-                   help="Percentile threshold for curvature-aware decimation (default 80.0).")
+                    help="Percentile threshold for curvature-aware decimation (default 80.0).")
     p.add_argument("--curvature_protect_rings", type=int, default=1,
-                   help="Ring dilation for curvature protection (default 1).")
+                    help="Ring dilation for curvature protection (default 1).")
     p.add_argument("--level_floor", action="store_true", default=False)
     p.add_argument("--workers", type=int, default=1)
 

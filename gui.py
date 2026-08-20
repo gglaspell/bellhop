@@ -16,6 +16,25 @@ no ICP/loop-closure -- neither ever had a registration step to begin
 with). This file wires the relevant new flags through to all seven
 profiles so the CLI commands the GUI builds actually use them end to end.
 
+PATCH NOTE (motion-gated frame selection + odometry health check wiring):
+Ported from `mesh.py`/`color_mesh.py`/`gazebo_world.py`/`tiles_3d.py`/
+`color_tiles_3d.py` (see `shared/registration.py` for the full design).
+`--frame_stride` has been removed from `_COMMON_REGISTRATION` -- it no
+longer exists on any of the five pipelines that share that param group,
+so the GUI could never have sent it without the pipeline rejecting it as
+an unrecognized argument. In its place, `_COMMON_REGISTRATION` now
+includes `min_move_distance`/`min_rotation_angle_deg` (motion-gated frame
+selection -- a frame is kept only if it moved/turned relative to the last
+KEPT frame's odometry pose) and `disable_odom_health_check`/
+`odom_loss_speed_multiplier` (the automatic odometry tracking-loss/
+teleport check, enabled by default). `og_map`'s own inline `frame_stride`
+field is UNCHANGED and intentionally NOT touched here -- `og_map.py` has
+its own independent, index-based `--frame_stride`/`--max_frames` CLI
+surface that never routed through `shared/registration.py` and was never
+part of this migration (see `registration.py`'s own docstring: "NOT used
+by: og_map"). `texture_baking` never had a `frame_stride` field either
+and is unaffected.
+
 PATCH NOTE (mesh/color_mesh PLY-only outputs):
 `mesh` and `color_mesh` no longer produce `.obj` mesh files -- both now
 write only a point-cloud `.ply` and a mesh `.ply`. `mesh`'s optional
@@ -32,8 +51,25 @@ LiDAR bags (see the PERF NOTE in og_map.py's module docstring). Those
 flags existed in the CLI but were missing from this GUI's OG Map
 profile, meaning the GUI could never pass them through to `docker run`.
 They are now added directly after the existing `octree_res`/`grid_res`
-fields, matching og_map.py's own defaults (`octree_max_range=-1.0`,
+fields, matching og_map.py's own defaults (`octree_max_range=40.0`,
 `octree_lazy_eval=True`, `octree_discretize=False`).
+
+PATCH NOTE (OG Map --octree_discretize default flipped to OFF -- upstream
+pyoctomap crash):
+The "OcTree discretize scan before insertion" checkbox previously
+defaulted to checked (`True`), matching og_map.py's old default. Running
+with it enabled crashes on every frame inside the pinned pyoctomap
+build's `insertPointCloud(discretize=True)` path with
+`AttributeError: 'OcTreeKey' object has no attribute 'thisptr'` -- a bug
+in pyoctomap's own Cython `OcTreeKey` construction, not in this project's
+code. og_map.py's own default was flipped to `False` for the same
+reason (see that file's module docstring, "BUGFIX (--octree_discretize
+now defaults OFF...)"). This checkbox is updated to match so a GUI run
+with no changes and a bare CLI run with no flags keep producing
+identical, working `docker run` commands. The checkbox (and the
+underlying flag) are left in place, unchecked by default, in case a
+future pyoctomap release fixes the bug and an operator wants to
+re-enable the speedup.
 
 BUGFIX (Texture Baking profile sent unrecognized arguments):
 The Texture Baking profile previously reused `_COMMON_COLOR` (built for
@@ -45,7 +81,7 @@ the camera-*projection*-coloring pipelines `color_mesh`/`color_tiles_3d`:
 per-point camera-projection step at all (it bakes a UV atlas from
 keyframe view assignment instead), and no isotropic-remesh CLI flag
 either. Sending them produced:
-  unrecognized arguments: --max_time_diff ... --remesh ...
+    unrecognized arguments: --max_time_diff ... --remesh ...
 and the pipeline exited with code 2 before doing any work. Fixed by
 replacing the profile's param list with one that matches
 `texture_baking.py`'s argparse exactly: `camera_topic`/`camera_info_topic`
@@ -102,9 +138,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Shared param groups
 # ---------------------------------------------------------------------------
+
+# PATCH: `frame_stride` removed (no longer exists on any of the five
+# pipelines that share this group -- see the PATCH NOTE at the top of this
+# file). `min_move_distance`/`min_rotation_angle_deg` (motion-gated frame
+# selection) and `disable_odom_health_check`/`odom_loss_speed_multiplier`
+# (automatic odometry tracking-loss truncation) take its place.
 _COMMON_REGISTRATION = [
     ("voxel_size", "Voxel size (m)", "entry", "0.05", {}),
     ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
+    (
+        "min_move_distance",
+        "Min move distance (m)",
+        "entry",
+        "0.50",
+        {},
+    ),
+    (
+        "min_rotation_angle_deg",
+        "Min rotation angle (deg)",
+        "entry",
+        "15.0",
+        {},
+    ),
     ("enable_icp_refinement", "Enable ICP refinement (optional, gated)", "check", False, {}),
     ("icp_dist_thresh", "ICP max correspondence (m)", "entry", "0.2", {}),
     ("icp_fitness_thresh", "ICP fitness threshold", "entry", "0.7", {}),
@@ -123,13 +179,6 @@ _COMMON_REGISTRATION = [
     ),
     ("workers", "Worker threads", "spinbox", "1", {"from_": 1, "to": 32}),
     (
-        "frame_stride",
-        "Registration frame stride",
-        "spinbox",
-        "2",
-        {"from_": 1, "to": 100},
-    ),
-    (
         "max_registration_frames",
         "Maximum registration frames (0 = all)",
         "entry",
@@ -142,6 +191,20 @@ _COMMON_REGISTRATION = [
         "spinbox",
         "16",
         {"from_": 1, "to": 500},
+    ),
+    (
+        "disable_odom_health_check",
+        "Disable odometry health check",
+        "check",
+        False,
+        {},
+    ),
+    (
+        "odom_loss_speed_multiplier",
+        "Odom loss sensitivity (x baseline)",
+        "entry",
+        "8.0",
+        {},
     ),
 ]
 
@@ -244,7 +307,10 @@ _GPS_TOPIC = [
 ]
 
 # PATCH: OcTree insertion perf flags for OG Map (see PATCH NOTE above).
-# Defaults match og_map.py's argparse defaults exactly.
+# Defaults match og_map.py's argparse defaults exactly. `octree_discretize`
+# defaults to unchecked (False) -- see the "PATCH NOTE (OG Map
+# --octree_discretize default flipped to OFF...)" note at the top of this
+# file for why.
 _OCTREE_PERF = [
     (
         "octree_max_range",
@@ -254,7 +320,13 @@ _OCTREE_PERF = [
         {},
     ),
     ("octree_lazy_eval", "OcTree lazy-eval inner-node update", "check", True, {}),
-    ("octree_discretize", "OcTree discretize scan before insertion", "check", True, {}),
+    (
+        "octree_discretize",
+        "OcTree discretize scan before insertion (off: pyoctomap crash)",
+        "check",
+        False,
+        {},
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -288,6 +360,12 @@ PROFILES = {
                 ("z_max", "Obstacle Z maximum (m)", "entry", "2.0", {}),
                 ("voxel_size", "Voxel size (m)", "entry", "0.10", {}),
                 ("odom_max_latency", "Odom max latency (s)", "entry", "0.5", {}),
+                # NOTE: og_map.py has its OWN independent, index-based
+                # --frame_stride/--max_frames CLI surface -- it never routed
+                # through shared/registration.py and was never part of the
+                # motion-gated-selection/odometry-health-check migration
+                # (see the PATCH NOTE at the top of this file). This field
+                # is intentionally unchanged.
                 (
                     "frame_stride",
                     "Frame stride",
@@ -371,8 +449,8 @@ PROFILES = {
                         ]
                     },
                 ),
+                # level_floor removed here -- already provided by _COMMON_RECONSTRUCTION
             ]
-            # level_floor removed here -- already provided by _COMMON_RECONSTRUCTION
             + _COMMON_REGISTRATION
             + _COMMON_RECONSTRUCTION
             + _REMESH_OPTIONS
@@ -480,14 +558,14 @@ PROFILES = {
                     "poisson_depth",
                     "Poisson depth",
                     "spinbox",
-                    "8",
+                    "9",
                     {"from_": 4, "to": 14},
                 ),
                 (
                     "poisson_max_distance",
                     "Poisson max distance (m)",
                     "entry",
-                    "0.5",
+                    "0.3",
                     {},
                 ),
                 (
@@ -501,11 +579,11 @@ PROFILES = {
                     "smooth_iterations",
                     "Smoothing iterations",
                     "spinbox",
-                    "5",
+                    "3",
                     {"from_": 0, "to": 50},
                 ),
                 ("smooth_lambda", "Smoothing lambda", "entry", "0.5", {}),
-                ("cull_min_angle", "Cull min angle (deg)", "entry", "75.0", {}),
+                ("cull_min_angle", "Cull min angle (deg)", "entry", "65.0", {}),
                 (
                     "target_faces",
                     "Target face count (blank = off)",
@@ -513,14 +591,14 @@ PROFILES = {
                     "",
                     {},
                 ),
-                ("assign_min_angle", "Assign min angle (deg)", "entry", "75.0", {}),
-                ("max_bake_distance", "Max bake distance (m)", "entry", "4.0", {}),
-                ("min_bake_distance", "Min bake distance (m)", "entry", "0.4", {}),
+                ("assign_min_angle", "Assign min angle (deg)", "entry", "70.0", {}),
+                ("max_bake_distance", "Max bake distance (m)", "entry", "10.0", {}),
+                ("min_bake_distance", "Min bake distance (m)", "entry", "1.0", {}),
                 (
                     "assignment_smooth_iterations",
                     "Assignment smoothing iterations",
                     "spinbox",
-                    "3",
+                    "6",
                     {"from_": 0, "to": 20},
                 ),
                 (
@@ -1208,6 +1286,14 @@ class BellhopGUI:
                     # --no-octree_lazy_eval flag to turn it off. Mirror that
                     # here: an unchecked box must explicitly disable it.
                     command.append("--no-octree_lazy_eval")
+                # NOTE: no elif branch is needed for "octree_discretize".
+                # Its GUI default and og_map.py's argparse default are both
+                # now False/off (see the "PATCH NOTE (OG Map
+                # --octree_discretize default flipped to OFF...)" note at
+                # the top of this file), so an unchecked box already
+                # matches the pipeline's own default and needs no explicit
+                # --no-octree_discretize flag. Checking the box appends
+                # --octree_discretize via the `if value:` branch above.
                 continue
 
             value = str(value).strip()
@@ -1311,6 +1397,7 @@ class BellhopGUI:
                         state="normal",
                         text="\u25b6 Run Pipeline",
                     )
+
         except queue.Empty:
             pass
 

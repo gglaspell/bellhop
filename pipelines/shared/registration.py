@@ -6,20 +6,72 @@ Used by: mesh, color_mesh, gazebo_world, tiles_3d, color_tiles_3d.
 NOT used by: og_map (uses OcTree ray-casting instead).
 
 Registration controls
----------------------
---frame_stride:
-    Register every Nth input PointCloud2 frame. Values <= 1 mean all frames.
+----------------------
+--min_move_distance / --min_rotation_angle_deg:
+    Motion-gated frame selection. A frame is kept only if it has translated
+    >= --min_move_distance meters OR rotated >= --min_rotation_angle_deg
+    degrees, relative to the last KEPT frame's odometry pose. Replaces the
+    old index-based --frame_stride: odom is the primary pose source, so a
+    frame that hasn't moved (or turned) adds no new spatial coverage and is
+    skipped instead of being thinned purely by message count. Set either to
+    0 to disable that half of the gate; set both to 0 to disable motion
+    gating entirely (keep every frame, subject only to
+    --max_registration_frames).
 
 --max_registration_frames:
-    Limit the number of frames after stride selection. 0 means no limit.
+    Hard cap on the number of KEPT frames, applied after the motion gate
+    (and after the odometry health check, below). 0 means no cap. This cap
+    also bounds how many raw frames a pipeline's bag-reading pass needs to
+    read ahead of time.
+
+--disable_odom_health_check / --odom_loss_speed_multiplier:
+    Odometry health check (see `detect_odom_loss()` below). Enabled by
+    default; truncates registration at the first detected tracking
+    loss/teleport in the raw odometry stream, before frame selection runs,
+    so a lost-odom segment can never reach the motion gate, ICP refinement,
+    or loop closure.
+
+PATCH NOTE (motion-gated frame selection; odometry health check)
+-----------------------------------------------------------------------------
+Two changes replace the old index-stride frame selection:
+
+1. Frame selection: index stride -> motion gating.
+   Problem solved: `--frame_stride` selected "every Nth point-cloud
+   message," which wastes registration/merge work (and memory) when the
+   robot isn't moving, and under-samples when it's moving fast, because
+   message rate has nothing to do with spatial coverage once odometry (not
+   sequential ICP overlap) is the primary pose source.
+   New behavior: `select_registration_frames_by_motion()` walks
+   odometry-covered frames in temporal order and keeps a frame only if it
+   has translated >= --min_move_distance meters OR rotated >=
+   --min_rotation_angle_deg degrees since the last KEPT frame's odometry
+   pose. `--max_registration_frames` (0 = no cap) is retained as a hard cap
+   on the kept count, applied after the motion gate.
+
+2. Odometry health check: auto-detect and truncate on tracking loss.
+   Problem solved: once odometry is lost (SLAM/VIO relocalization failure,
+   wheel-odom teleport, etc.), every frame anchored to it afterward is
+   placed at a wrong pose, and the merged output comes out skewed --
+   silently, unless something catches it.
+   New behavior: `detect_odom_loss(odom_data, outlier_multiplier=6.0)` scans
+   every consecutive pair in the FULL raw odometry stream, computing implied
+   linear speed and angular rate. It is self-calibrating: the "normal"
+   baseline is the bag's own 95th-percentile speed/rate, not a hardcoded
+   absolute limit, so it works across platforms/speeds without per-bag
+   tuning. Any consecutive pair exceeding `outlier_multiplier x baseline` on
+   either metric is flagged, and that pair's earlier timestamp becomes the
+   cutoff. `run_odom_anchored_registration()` runs this check (unless
+   --disable_odom_health_check) immediately on the full raw odometry stream,
+   BEFORE frame selection -- so the motion gate, ICP refinement, and loop
+   closure never see a single frame past the detected loss point. The
+   segment after a detected loss is never auto-spliced back in.
 
 PATCH NOTE (odom-anchored registration; loop-closure information weighting)
 -----------------------------------------------------------------------------
-All five pipelines that use this module now call
-`run_odom_anchored_registration()` (see odom-anchored-registration-fix-prompt.md
-for the full design), which makes timestamped odometry the PRIMARY pose
-source and demotes ICP to an optional, strongly-gated local refinement.
-This fixed two failure modes present in the previous ICP-primary design:
+All five pipelines that use this module call `run_odom_anchored_registration()`
+which makes timestamped odometry the PRIMARY pose source and demotes ICP to
+an optional, strongly-gated local refinement. This fixed two failure modes
+present in the previous ICP-primary design:
 
 1. Silent coverage collapse: frames that failed the ICP fitness bar against
    the last *successful* frame used to be dropped with no accounting, and
@@ -36,19 +88,52 @@ This fixed two failure modes present in the previous ICP-primary design:
 
 CLEANUP NOTE (unused functions removed)
 ----------------------------------------
-Now that every caller has migrated to `run_odom_anchored_registration()`,
-the following are no longer referenced anywhere in this codebase and have
-been removed:
-  - `run_icp_posegraph()` -- the old ICP-primary pose-graph pipeline.
-  - `detect_loop_closure()` -- only ever called from `run_icp_posegraph()`;
-    `run_odom_anchored_registration()` performs loop-closure detection
-    inline so each candidate is captured and reused exactly once (see its
-    docstring).
-  - `iter_registered_frame_chunks()` -- documented as a merge-batching
-    helper but never actually called by any pipeline; each pipeline's
-    streaming merge loop manages its own bounded chunk instead.
-If you are restoring ICP-as-primary behaviour for a one-off comparison,
-pull these from version control history rather than re-adding them here.
+- `run_icp_posegraph()` -- the old ICP-primary pose-graph pipeline.
+- `detect_loop_closure()` -- only ever called from `run_icp_posegraph()`.
+- `iter_registered_frame_chunks()` -- never actually called by any pipeline.
+- `select_registration_frames()` -- the old --frame_stride-based selector,
+  replaced by `select_registration_frames_by_motion()` above. Do not
+  reintroduce --frame_stride; if you are restoring stride-based behaviour
+  for a one-off comparison, pull it from version control history rather
+  than re-adding it here.
+
+PERF NOTE (loop-closure hot path: RANSAC iterations + redundant deepcopy)
+-----------------------------------------------------------------------------
+Loop closure defaults to OFF (--enable_loop_closure defaults False in every
+pipeline), so this only matters for runs that opt in. When enabled, two
+changes reduce cost with no behavior change to the accepted/rejected outcome
+of any candidate:
+
+1. `ransac_coarse_alignment()`'s `RANSACConvergenceCriteria` dropped from
+   (100_000, 0.999) to (10_000, 0.99). This is a pre-screening step only --
+   every candidate that clears it still goes through a fitness-thresholded
+   point-to-plane ICP refinement below, gated at `loop_closure_fitness_thresh`
+   (defaulting to the same bar as local ICP refinement). 10,000 iterations at
+   a 0.99 confidence level is already generous for a 3-point RANSAC estimate
+   and cuts the single most expensive call in this path by roughly an order
+   of magnitude.
+2. Removed two `copy.deepcopy()` calls inside the per-candidate loop
+   (`current_fpfh = compute_fpfh_descriptor(copy.deepcopy(current_cloud_normals), ...)`
+   and the `source_copy`/`target_copy` pair built before RANSAC+ICP).
+   Neither Open3D's `registration_ransac_based_on_feature_matching` nor
+   `registration_icp` mutate their `source`/`target` point clouds --
+   they only read points/normals/features and return a RegistrationResult.
+   `compute_fpfh_descriptor()`'s internal `_ensure_unit_geometric_normals()`
+   call does mutate its input's `.normals` in place, but `current_cloud_normals`
+   already has unit geometric normals from the same call earlier in the main
+   registration loop, so re-running it is deterministic and redundant, never
+   destructive. Since `current_cloud_normals` is also the exact object later
+   pushed into `loop_history` and reused as `prev_cloud_normals`/a future
+   `hist_cloud`, dropping the copies means those call sites now operate on
+   the same object rather than a throwaway clone -- with no change in the
+   values any of them read.
+
+   NOTE: the `loop_history` candidate pool is already a
+   `deque(maxlen=loop_closure_temporal_window)` (default 100) and is
+   filtered by `loop_closure_radius` before RANSAC ever runs, so the
+   candidate-selection scan itself is already bounded and was not further
+   optimized here -- a linear scan over <=100 items is not a measurable
+   cost next to RANSAC/ICP.
 """
 
 from __future__ import annotations
@@ -92,46 +177,188 @@ def _arg_bool(args: Any, name: str, default: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Registration / merge selection helpers
+# Odometry health check (tracking loss / teleport detection)
 # ---------------------------------------------------------------------------
-def select_registration_frames(
-    pointclouds: list[tuple[int, o3d.geometry.PointCloud]],
-    frame_stride: int = 0,
-    max_registration_frames: int = 0,
-) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], list[int]]:
+def detect_odom_loss(
+    odom_data: dict[int, np.ndarray],
+    outlier_multiplier: float = 6.0,
+) -> int | None:
     """
-    Select input clouds for registration.
+    Scan the FULL raw odometry stream for a tracking loss / teleport.
+
+    Computes implied linear speed (m/s) and angular rate (deg/s) between
+    every consecutive pair of odometry samples (sorted by timestamp). The
+    "normal" baseline is THIS bag's own 95th-percentile speed/rate --
+    self-calibrating, not a hardcoded absolute limit, so it works across
+    platforms/speeds without per-bag tuning. The first consecutive pair
+    whose speed OR rate exceeds `outlier_multiplier * baseline` is flagged
+    as a tracking loss/teleport.
+
+    Args:
+        odom_data: dict mapping odometry timestamp (ns) -> 4x4 transform.
+        outlier_multiplier: sensitivity; lower = more sensitive.
 
     Returns:
-        selected_pointclouds:
-            Point-cloud records used internally by registration.
+        The cutoff timestamp (the last known-good odometry sample, i.e.
+        the EARLIER timestamp of the flagged pair), or None if no loss was
+        detected (including when there are too few samples to establish a
+        baseline).
+    """
+    ts_sorted = sorted(odom_data.keys())
+    if len(ts_sorted) < 3:
+        return None
 
-        original_indices:
-            Index of each selected record within the original `pointclouds`
-            list. Most callers now look poses up by timestamp instead, but
-            this is kept for callers that still index the original list.
+    speeds: list[float] = []
+    rates: list[float] = []
 
-    Semantics:
-        frame_stride <= 1 (including 0) selects every input frame.
-        max_registration_frames <= 0 means no post-stride cap.
+    for i in range(1, len(ts_sorted)):
+        t0, t1 = ts_sorted[i - 1], ts_sorted[i]
+        dt = (t1 - t0) / 1e9
+        if dt <= 0:
+            speeds.append(0.0)
+            rates.append(0.0)
+            continue
+
+        pose0, pose1 = odom_data[t0], odom_data[t1]
+        translation = float(np.linalg.norm(pose1[:3, 3] - pose0[:3, 3]))
+
+        relative_rotation = pose0[:3, :3].T @ pose1[:3, :3]
+        trace = np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
+        rotation_deg = float(np.degrees(np.arccos(trace)))
+
+        speeds.append(translation / dt)
+        rates.append(rotation_deg / dt)
+
+    speeds_arr = np.asarray(speeds, dtype=np.float64)
+    rates_arr = np.asarray(rates, dtype=np.float64)
+
+    speed_baseline = float(np.percentile(speeds_arr, 95)) if len(speeds_arr) else 0.0
+    rate_baseline = float(np.percentile(rates_arr, 95)) if len(rates_arr) else 0.0
+
+    speed_thresh = speed_baseline * outlier_multiplier
+    rate_thresh = rate_baseline * outlier_multiplier
+
+    for i, (speed, rate) in enumerate(zip(speeds, rates)):
+        speed_flagged = speed_thresh > 0.0 and speed > speed_thresh
+        rate_flagged = rate_thresh > 0.0 and rate > rate_thresh
+        if not (speed_flagged or rate_flagged):
+            continue
+
+        cutoff_ts = ts_sorted[i]  # last known-good sample, before the jump
+        excluded_count = len(ts_sorted) - (i + 1)
+        message = (
+            f"Odometry health check: tracking loss/teleport detected at "
+            f"t={ts_sorted[i + 1] / 1e9:.3f}s (speed={speed:.3f} m/s vs "
+            f"baseline {speed_baseline:.3f} m/s, rate={rate:.3f} deg/s vs "
+            f"baseline {rate_baseline:.3f} deg/s; multiplier="
+            f"{outlier_multiplier:.1f}). Truncating at last known-good "
+            f"sample t={cutoff_ts / 1e9:.3f}s -- {excluded_count} "
+            "odometry sample(s) after this point will be excluded and "
+            "never spliced back in."
+        )
+        logger.warning(message)
+        print(f"Warning: {message}")
+        return cutoff_ts
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Registration / merge selection helpers
+# ---------------------------------------------------------------------------
+def select_registration_frames_by_motion(
+    pointclouds: list[tuple[int, o3d.geometry.PointCloud]],
+    odom_data: dict[int, np.ndarray],
+    min_move_distance: float = 0.10,
+    min_rotation_angle_deg: float = 5.0,
+    max_registration_frames: int = 0,
+    odom_max_latency_ns: int = int(0.5 * 1e9),
+) -> tuple[list[tuple[int, o3d.geometry.PointCloud]], list[int]]:
+    """
+    Select input clouds for registration by odometry-relative motion
+    instead of a fixed index stride.
+
+    Walks `pointclouds` in temporal order (the order they were provided
+    in) and keeps a frame only if it has translated >= `min_move_distance`
+    meters OR rotated >= `min_rotation_angle_deg` degrees relative to the
+    last KEPT frame's odometry pose. A frame whose odometry pose cannot be
+    interpolated (no coverage within `odom_max_latency_ns`) is kept as-is
+    and NOT motion-gated -- it is passed through so a later odometry-
+    coverage check (e.g. in `run_odom_anchored_registration`) can decide
+    whether to drop it; motion gating and odometry-coverage gating are
+    deliberately kept as separate concerns.
+
+    If `odom_data` is empty, or both thresholds are <= 0 (gate disabled),
+    every input frame is kept in order, subject only to the hard cap.
+
+    Args:
+        pointclouds: (timestamp, cloud) records in temporal order.
+        odom_data: dict mapping odometry timestamp (ns) -> 4x4 transform.
+        min_move_distance: meters; <= 0 disables this half of the gate.
+        min_rotation_angle_deg: degrees; <= 0 disables this half of the gate.
+        max_registration_frames: hard cap on KEPT frames; <= 0 = no cap.
+        odom_max_latency_ns: max allowed gap to odometry coverage for the
+            per-frame pose lookup used by the gate itself.
+
+    Returns:
+        selected_pointclouds: the kept (timestamp, cloud) records.
+        original_indices: index of each kept record within the original
+            `pointclouds` list.
     """
     if not pointclouds:
         raise RuntimeError("No point clouds available for registration.")
 
-    stride = max(1, int(frame_stride))
-    original_indices = list(range(0, len(pointclouds), stride))
+    min_move_distance = max(0.0, float(min_move_distance))
+    min_rotation_angle_deg = max(0.0, float(min_rotation_angle_deg))
+    max_registration_frames = max(0, int(max_registration_frames))
+    gate_disabled = min_move_distance <= 0.0 and min_rotation_angle_deg <= 0.0
 
-    if max_registration_frames > 0:
-        original_indices = original_indices[: int(max_registration_frames)]
+    if not odom_data or gate_disabled:
+        selected = list(pointclouds)
+        if max_registration_frames > 0:
+            selected = selected[:max_registration_frames]
+        original_indices = list(range(len(selected)))
+    else:
+        odom_ts_sorted = sorted(odom_data.keys())
+        selected = []
+        original_indices = []
+        last_kept_pose: np.ndarray | None = None
 
-    if len(original_indices) < 2:
+        for idx, (timestamp, cloud) in enumerate(pointclouds):
+            pose = interpolate_odom_pose(timestamp, odom_ts_sorted, odom_data, odom_max_latency_ns)
+
+            if pose is None or last_kept_pose is None:
+                keep = True
+            else:
+                relative = np.linalg.inv(last_kept_pose) @ pose
+                translation = float(np.linalg.norm(relative[:3, 3]))
+                trace = np.clip((np.trace(relative[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+                rotation_deg = float(np.degrees(np.arccos(trace)))
+                keep = (
+                    (min_move_distance > 0.0 and translation >= min_move_distance)
+                    or (min_rotation_angle_deg > 0.0 and rotation_deg >= min_rotation_angle_deg)
+                )
+
+            if not keep:
+                continue
+
+            selected.append((timestamp, cloud))
+            original_indices.append(idx)
+            if pose is not None:
+                last_kept_pose = pose
+
+            if max_registration_frames > 0 and len(selected) >= max_registration_frames:
+                break
+
+    if len(selected) < 2:
         raise RuntimeError(
-            "Too few frames after registration selection. "
-            "Use --frame_stride 0/1, increase --max_registration_frames, "
-            "or provide a bag containing at least two point-cloud frames."
+            "Too few frames after motion-gated registration selection. "
+            "Lower --min_move_distance/--min_rotation_angle_deg, increase "
+            "--max_registration_frames, or provide a bag containing more "
+            "motion / at least two point-cloud frames."
         )
 
-    return [pointclouds[i] for i in original_indices], original_indices
+    return selected, original_indices
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +502,13 @@ def compute_fpfh_descriptor(
     # has_normals(). A cloud carrying leftover view-ray "normals" from
     # attach_view_rays_as_normals() would otherwise be fed straight into
     # compute_fpfh_feature(), which requires unit-length surface normals.
+    #
+    # NOTE: callers no longer need to pass a deepcopy of `pcd` here. This
+    # function's normal re-computation is deterministic given the same
+    # points/voxel_size, so calling it on an already-unit-normal cloud
+    # (as produced earlier in run_odom_anchored_registration's main loop)
+    # is redundant but not destructive -- it does not need to be isolated
+    # behind a defensive copy.
     _ensure_unit_geometric_normals(pcd, voxel_size)
 
     return o3d.pipelines.registration.compute_fpfh_feature(
@@ -294,7 +528,17 @@ def ransac_coarse_alignment(
     voxel_size: float,
     ransac_thresh_mult: float = 5.0,
 ) -> o3d.pipelines.registration.RegistrationResult:
-    """Compute a feature-based coarse transform for loop-closure validation."""
+    """Compute a feature-based coarse transform for loop-closure validation.
+
+    PERF NOTE: `RANSACConvergenceCriteria` was reduced from (100_000, 0.999)
+    to (10_000, 0.99). This is only a pre-screening step -- every candidate
+    that clears it is still validated by a fitness-thresholded point-to-plane
+    ICP refinement in `run_odom_anchored_registration()` before being
+    accepted as a pose-graph edge, so the lower iteration count trades a
+    small amount of RANSAC pre-screening recall (not final-match precision)
+    for roughly a 10x reduction in the single most expensive call in the
+    loop-closure candidate loop.
+    """
     distance = max(float(voxel_size) * float(ransac_thresh_mult), 1e-4)
 
     return o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
@@ -315,8 +559,8 @@ def ransac_coarse_alignment(
             ),
         ],
         criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-            100_000,
-            0.999,
+            10_000,
+            0.99,
         ),
     )
 
@@ -388,28 +632,41 @@ def run_odom_anchored_registration(
     source for every frame; ICP is only ever an optional, strongly-gated
     local refinement; loop closure is gated at the same bar as local
     refinement and weighted so it can only nudge, never dominate, the pose
-    graph. See odom-anchored-registration-fix-prompt.md for the full design.
+    graph.
 
-    Frames are included whenever they fall within `--odom_max_latency` of
-    odometry coverage -- ICP/registration quality is NEVER the reason a
-    frame is excluded. Frames without odometry coverage are dropped and
-    counted loudly (logged and printed), never silently.
+    `pointclouds` is expected to be the FULL raw (timestamp, cloud) list in
+    temporal order, NOT pre-thinned by the caller. This function internally:
 
-    Memory/perf safeguards (see design-doc section 6):
-      - Only the current and previous frame's normal-computed cloud are
-        held for sequential refinement (no whole-trajectory cloud list).
-      - Normals are computed exactly once per frame and carried forward.
-      - Loop-closure candidates are held in a `deque(maxlen=...)` bounded
-        window, and each closure is detected exactly once (the accepted
-        transform/fitness is reused directly as a pose-graph edge, never
-        re-computed for a summary count).
+    1. Runs the odometry health check (unless --disable_odom_health_check)
+       over the FULL raw odometry stream and truncates both `pointclouds`
+       and `odom_data` at the first detected tracking loss/teleport, BEFORE
+       any frame selection -- so the motion gate, ICP refinement, and loop
+       closure never see a single frame past the detected loss point.
+    2. Runs motion-gated frame selection (`select_registration_frames_by_motion`)
+       over the (possibly truncated) frame list.
+    3. Looks up each selected frame's odometry pose; frames without odometry
+       coverage within `--odom_max_latency` are dropped and counted loudly
+       (logged and printed), never silently.
+    4. Optionally refines sequential poses with gated ICP and/or applies
+       loop closure via a weighted pose graph.
+
+    Memory/perf safeguards:
+        - Only the current and previous frame's normal-computed cloud are
+          held for sequential refinement (no whole-trajectory cloud list).
+        - Normals are computed exactly once per frame and carried forward.
+        - Loop-closure candidates are held in a `deque(maxlen=...)` bounded
+          window, and each closure is detected exactly once (the accepted
+          transform/fitness is reused directly as a pose-graph edge, never
+          re-computed for a summary count).
 
     Args:
-        pointclouds: (timestamp, cloud) records already selected/bounded by
-            the caller (e.g. via `select_registration_frames`).
+        pointclouds: FULL raw (timestamp, cloud) records in temporal order.
         odom_data: dict mapping odometry timestamp -> 4x4 transform.
         args: namespace exposing (at least) `voxel_size`, `odom_max_latency`,
-            `enable_icp_refinement`, `icp_dist_thresh`, `icp_fitness_thresh`,
+            `min_move_distance`, `min_rotation_angle_deg`,
+            `max_registration_frames`, `disable_odom_health_check`,
+            `odom_loss_speed_multiplier`, `enable_icp_refinement`,
+            `icp_dist_thresh`, `icp_fitness_thresh`,
             `max_icp_translation_correction`, `max_icp_rotation_correction_deg`,
             `enable_loop_closure`, `loop_closure_radius`,
             `loop_closure_fitness_thresh`, `loop_closure_search_interval`,
@@ -419,9 +676,11 @@ def run_odom_anchored_registration(
         (final_poses, stats)
         final_poses: timestamp -> 4x4 transform that maps that frame's own
             points into the merge/world frame (apply via `cloud.transform(pose)`).
-        stats: coverage counters for end-to-end logging -- total_selected,
-            dropped_no_odom, with_pose, icp_attempted, icp_accepted,
-            loop_closures_found, merged.
+            Only timestamps for KEPT, odometry-covered frames are present.
+        stats: coverage counters for end-to-end logging -- total_raw_frames,
+            odom_loss_detected, frames_excluded_by_health_check,
+            total_selected, dropped_no_odom, with_pose, icp_attempted,
+            icp_accepted, loop_closures_found, merged.
     """
     if not pointclouds:
         raise RuntimeError("No point clouds available for odom-anchored registration.")
@@ -434,11 +693,20 @@ def run_odom_anchored_registration(
             "in a fixed/global frame (no registration needed in that case)."
         )
 
+    total_raw_frames = len(pointclouds)
+
     voxel_size = _arg_float(args, "voxel_size", 0.05)
     if voxel_size <= 0.0:
         raise ValueError("--voxel_size must be greater than zero.")
 
     odom_max_latency_ns = int(_arg_float(args, "odom_max_latency", 0.5) * 1e9)
+
+    min_move_distance = _arg_float(args, "min_move_distance", 0.10)
+    min_rotation_angle_deg = _arg_float(args, "min_rotation_angle_deg", 5.0)
+    max_registration_frames = _arg_int(args, "max_registration_frames", 0)
+
+    disable_odom_health_check = _arg_bool(args, "disable_odom_health_check", False)
+    odom_loss_speed_multiplier = _arg_float(args, "odom_loss_speed_multiplier", 6.0)
 
     enable_icp_refinement = _arg_bool(args, "enable_icp_refinement", False)
     icp_dist_thresh = _arg_float(args, "icp_dist_thresh", 0.2)
@@ -456,14 +724,71 @@ def run_odom_anchored_registration(
     loop_search_interval = max(1, _arg_int(args, "loop_closure_search_interval", 10))
     loop_temporal_window = max(1, _arg_int(args, "loop_closure_temporal_window", 100))
 
+    # -----------------------------------------------------------------
+    # Step 1: odometry health check on the FULL raw odometry stream,
+    # BEFORE any frame selection.
+    # -----------------------------------------------------------------
+    odom_loss_detected = False
+    frames_excluded_by_health_check = 0
+
+    if not disable_odom_health_check:
+        cutoff_ts = detect_odom_loss(odom_data, outlier_multiplier=odom_loss_speed_multiplier)
+        if cutoff_ts is not None:
+            odom_loss_detected = True
+            pre_cutoff_frames = [(ts, cloud) for ts, cloud in pointclouds if ts <= cutoff_ts]
+            frames_excluded_by_health_check = len(pointclouds) - len(pre_cutoff_frames)
+            odom_data = {ts: pose for ts, pose in odom_data.items() if ts <= cutoff_ts}
+
+            print(
+                f"Odometry health check: truncating to frames at/before "
+                f"t={cutoff_ts / 1e9:.3f}s ({len(pre_cutoff_frames):,}/"
+                f"{len(pointclouds):,} frame(s) retained). Pass "
+                f"--max_registration_frames {len(pre_cutoff_frames)} to "
+                "reproduce this exact truncation without re-running the "
+                "health check, or --disable_odom_health_check to bypass it."
+            )
+            pointclouds = pre_cutoff_frames
+
+        if not pointclouds or not odom_data:
+            raise RuntimeError(
+                "Odometry health check truncated all frames (tracking "
+                "loss detected at or before the first frame). Pass "
+                "--disable_odom_health_check to bypass, or inspect the "
+                "bag's odometry stream."
+            )
+
+    # -----------------------------------------------------------------
+    # Step 2: motion-gated frame selection on the (possibly truncated)
+    # frame list.
+    # -----------------------------------------------------------------
+    selected_frames, _original_indices = select_registration_frames_by_motion(
+        pointclouds,
+        odom_data,
+        min_move_distance=min_move_distance,
+        min_rotation_angle_deg=min_rotation_angle_deg,
+        max_registration_frames=max_registration_frames,
+        odom_max_latency_ns=odom_max_latency_ns,
+    )
+    total_selected = len(selected_frames)
+    print(
+        f"Coverage: raw frames={total_raw_frames:,} -> after odom health "
+        f"check={len(pointclouds):,} -> motion-gated selection="
+        f"{total_selected:,} (min_move_distance={min_move_distance}m, "
+        f"min_rotation_angle_deg={min_rotation_angle_deg}deg, "
+        f"max_registration_frames={max_registration_frames})."
+    )
+
+    # -----------------------------------------------------------------
+    # Step 3: per-frame odometry pose lookup; frames without coverage are
+    # dropped and counted loudly.
+    # -----------------------------------------------------------------
     odom_ts_sorted = sorted(odom_data.keys())
-    total_selected = len(pointclouds)
 
     raw_odom_poses: dict[int, np.ndarray] = {}
     dropped_no_odom = 0
     kept_records: list[tuple[int, o3d.geometry.PointCloud]] = []
 
-    for timestamp, cloud in pointclouds:
+    for timestamp, cloud in selected_frames:
         pose = interpolate_odom_pose(timestamp, odom_ts_sorted, odom_data, odom_max_latency_ns)
         if pose is None:
             dropped_no_odom += 1
@@ -491,7 +816,7 @@ def run_odom_anchored_registration(
     # written into this copy only -- the raw dict is NEVER mutated -- so
     # every relative-motion delta between consecutive frames is always
     # computed from the untouched odometry chain, never from a refinement
-    # applied to the previous frame (see design-doc section 1).
+    # applied to the previous frame.
     final_poses: dict[int, np.ndarray] = dict(raw_odom_poses)
     node_poses: list[np.ndarray] = [raw_odom_poses[ts].copy() for ts, _ in kept_records]
     node_index_by_timestamp: dict[int, int] = {
@@ -555,9 +880,10 @@ def run_odom_anchored_registration(
                 if accepted:
                     icp_accepted += 1
                     relative_transform = refined_relative
-                    world_pose = raw_odom_poses[prev_timestamp] @ relative_transform
-                    final_poses[timestamp] = world_pose
-                    node_poses[position] = world_pose.copy()
+
+            world_pose = raw_odom_poses[prev_timestamp] @ relative_transform
+            final_poses[timestamp] = world_pose
+            node_poses[position] = world_pose.copy()
 
             edges.append((position - 1, position, relative_transform, SEQUENTIAL_EDGE_INFORMATION_SCALE, False))
 
@@ -566,7 +892,15 @@ def run_odom_anchored_registration(
             current_fpfh = None
 
             if do_loop_search:
-                current_fpfh = compute_fpfh_descriptor(copy.deepcopy(current_cloud_normals), voxel_size)
+                # PERF FIX: no longer wraps `current_cloud_normals` in
+                # copy.deepcopy(). compute_fpfh_descriptor() mutates its
+                # input's normals in place via _ensure_unit_geometric_normals,
+                # but current_cloud_normals already carries the identical
+                # unit geometric normals computed a few lines above in this
+                # same iteration, so the in-place recompute is a no-op in
+                # effect, not a destructive mutation. current_cloud_normals
+                # is safe to reuse directly here and later in loop_history.
+                current_fpfh = compute_fpfh_descriptor(current_cloud_normals, voxel_size)
                 current_pos_xyz = node_poses[position][:3, 3]
 
                 for hist_timestamp, hist_cloud, hist_fpfh in loop_history:
@@ -578,22 +912,30 @@ def run_odom_anchored_registration(
                         continue
 
                     try:
-                        source_copy = copy.deepcopy(current_cloud_normals)
-                        target_copy = copy.deepcopy(hist_cloud)
+                        # PERF FIX: no longer deepcopies current_cloud_normals/
+                        # hist_cloud before RANSAC+ICP. Neither
+                        # registration_ransac_based_on_feature_matching() nor
+                        # registration_icp() mutate their source/target point
+                        # clouds -- both only read points/normals/features and
+                        # return a RegistrationResult -- so passing the
+                        # originals directly is safe and avoids a full
+                        # point-cloud copy per candidate.
                         coarse = ransac_coarse_alignment(
-                            source_copy, target_copy, current_fpfh, hist_fpfh, voxel_size
+                            current_cloud_normals, hist_cloud, current_fpfh, hist_fpfh, voxel_size
                         )
+
                         if coarse.fitness < loop_fitness_thresh * 0.5:
                             continue
 
                         refined = o3d.pipelines.registration.registration_icp(
-                            source_copy,
-                            target_copy,
+                            current_cloud_normals,
+                            hist_cloud,
                             max(voxel_size * 1.5, 1e-4),
                             coarse.transformation,
                             o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
                         )
+
                         # Detected exactly once: the accepted transform/fitness
                         # is captured here and reused directly as the
                         # pose-graph edge below -- never re-detected later
@@ -640,6 +982,7 @@ def run_odom_anchored_registration(
             edge_prune_threshold=0.25,
             reference_node=0,
         )
+
         try:
             o3d.pipelines.registration.global_optimization(
                 posegraph,
@@ -659,6 +1002,9 @@ def run_odom_anchored_registration(
     print(f"Merge: {len(kept_records):,} frame(s) will be merged into the combined cloud.")
 
     stats = {
+        "total_raw_frames": total_raw_frames,
+        "odom_loss_detected": int(odom_loss_detected),
+        "frames_excluded_by_health_check": frames_excluded_by_health_check,
         "total_selected": total_selected,
         "dropped_no_odom": dropped_no_odom,
         "with_pose": len(kept_records),

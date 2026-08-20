@@ -15,13 +15,13 @@ Pipeline:
 2. Average GPS fixes to establish ENU origin.
 3. Read PointCloud2 + optional Odometry + Camera + CameraInfo.
 4. Odom-anchored registration (shared), or identity transform if the point
-   cloud is already published in a global/fixed frame.
+cloud is already published in a global/fixed frame.
 5. Project camera images onto each registered frame.
 6. Merge colored frames (gray-fill filtering + voxel downsample).
 7. Clean merged cloud.
 8. ENU -> ECEF conversion.
 9. Write colored ECEF PLY per LOD level -> py3dtiles convert -> one
-   tileset_<name>/ directory per level (coarse/medium/fine by default).
+tileset_/ directory per level (coarse/medium/fine by default).
 
 REFACTOR NOTE: Bag-reading, world-frame merge, and the ENU->ECEF->PLY->
 py3dtiles tail-end logic live in `shared/tiles_common.py` and are shared
@@ -50,16 +50,35 @@ pointcloud-frame-check-prompt-2.md. Mirrors the same change already applied
 to `mesh.py`, `color_mesh.py`, `gazebo_world.py`, and `tiles_3d.py`:
 
 - The point cloud's frame_id is detected (or overridden via
-  --pc_frame_mode) and classified as 'global' (odom/map/world) or 'local'
-  (a moving sensor/base frame).
+--pc_frame_mode) and classified as 'global' (odom/map/world) or 'local'
+(a moving sensor/base frame).
 - 'local' frames are registered via `run_odom_anchored_registration()`
-  (odometry primary, ICP optional/gated, loop closure gated at the same
-  bar and weighted so it can only nudge the graph).
+(odometry primary, ICP optional/gated, loop closure gated at the same
+bar and weighted so it can only nudge the graph).
 - 'global' frames use an identity transform (a correct no-op -- no ICP,
-  no pose graph); the camera origin used for image projection and view-ray
-  normals still comes from interpolated odometry when available, since
-  there is no separate registration transform in this branch to create a
-  frame mismatch.
+no pose graph); the camera origin used for image projection and view-ray
+normals still comes from interpolated odometry when available, since
+there is no separate registration transform in this branch to create a
+frame mismatch.
+
+PATCH NOTE (motion-gated frame selection + odometry health check):
+Ported from `mesh.py`/`color_mesh.py`/`gazebo_world.py`/`tiles_3d.py`:
+`--frame_stride` has been removed in favor of motion-gated selection.
+`--min_move_distance`/`--min_rotation_angle_deg` now keep a frame only if
+it has actually moved/turned relative to the last KEPT frame's odometry
+pose (OR'd together), instead of thinning purely by message count. An
+odometry health check now runs automatically (unless
+--disable_odom_health_check) and truncates registration at the first
+detected tracking loss/teleport in the raw odometry stream, before any
+frame is selected -- both changes are handled internally by
+`run_odom_anchored_registration()` for the 'local' branch, and via
+`select_registration_frames_by_motion()` directly for the 'global'
+branch. See `shared/registration.py` for the full design. This also
+fixes a latent breakage: `select_registration_frames` (the old
+--frame_stride-based selector this file used to import) had already been
+removed from `shared/registration.py` when the other four pipelines were
+migrated, so this file's import of it was dead and would have raised an
+ImportError the first time this module was actually loaded.
 
 BUGFIX (camera_info_topic validation order):
 `--camera_topic` requires `--camera_info_topic`, and this was already
@@ -80,11 +99,18 @@ The final export step now calls
 single-layer `georeference_and_export_tileset()`. The same cleaned/merged
 colored cloud is voxel-downsampled at three densities (coarse/medium/fine
 by default, configurable via `--lod_multipliers`) and each density is
-written into its own `tileset_<name>/` subfolder under `outputdir`, so a
+written into its own `tileset_/` subfolder under `outputdir`, so a
 Cesium viewer can offer a quality/performance toggle between layers
 instead of being stuck with one fixed-resolution tileset. Color is
 preserved at every LOD level since `voxel_down_sample()` averages colors
 of merged points rather than dropping them.
+
+PATCH NOTE (defaults aligned to tiles_3d):
+`--pc_topic`, `--loop_closure_radius`, and `--workers` now default to the
+same values `tiles_3d.py` uses (`/points`, `3.0`, and `1` respectively),
+instead of this pipeline's previously divergent defaults (`points`,
+`10.0`, `4`), so a bare CLI invocation of either pipeline against the
+same bag behaves consistently out of the box.
 """
 
 import sys
@@ -106,7 +132,7 @@ from .shared.reconstruction import clean_point_cloud
 from .shared.registration import (
     _safe_normalize,
     run_odom_anchored_registration,
-    select_registration_frames,
+    select_registration_frames_by_motion,
 )
 from .shared.ros_io import (
     convert_ros_image,
@@ -164,6 +190,7 @@ def _merge_colored_pcds(
             if pcd.has_normals()
             else np.zeros((len(pts), 3), dtype=np.float64)
         )
+
         all_pts.append(pts)
         all_cols.append(cols)
         all_nors.append(nors)
@@ -299,28 +326,40 @@ def run(args) -> None:
 
     print(f"  Coverage: frames read = {len(pointclouds):,} | odom poses = {len(odom_data):,}")
 
-    selected_frames, _original_indices = select_registration_frames(
-        pointclouds, frame_stride=args.frame_stride, max_registration_frames=args.max_registration_frames
-    )
-    print(
-        f"  Coverage: frames selected = {len(selected_frames):,} / {len(pointclouds):,} "
-        f"(stride={args.frame_stride}, max={args.max_registration_frames})."
-    )
-    del pointclouds
-
     # -- Registration --------------------------------------------------
+    # NOTE: frame selection (motion gating + the odometry health check) is
+    # NOT applied here up front. For the 'local' branch it now happens once,
+    # internally, inside `run_odom_anchored_registration()` (which needs the
+    # FULL raw frame/odom lists to run its health check and motion gate in
+    # the correct order). For the 'global' branch it is applied directly via
+    # `select_registration_frames_by_motion()` below.
     if frame_mode == "global":
         print(
             "\n[3/7] Point cloud already in a global/fixed frame: skipping "
             "ICP/pose-graph registration and per-frame transform application."
         )
+        selected_frames, _original_indices = select_registration_frames_by_motion(
+            pointclouds,
+            odom_data,
+            min_move_distance=args.min_move_distance,
+            min_rotation_angle_deg=args.min_rotation_angle_deg,
+            max_registration_frames=args.max_registration_frames,
+            odom_max_latency_ns=int(args.odom_max_latency * 1e9),
+        )
+        print(
+            f"  Coverage: frames selected = {len(selected_frames):,} / {len(pointclouds):,} "
+            f"(min_move_distance={args.min_move_distance}m, "
+            f"min_rotation_angle_deg={args.min_rotation_angle_deg}deg, "
+            f"max={args.max_registration_frames})."
+        )
         pose_by_timestamp: dict[int, np.ndarray] = {
             timestamp: np.eye(4, dtype=np.float64) for timestamp, _ in selected_frames
         }
+        del selected_frames
         print(f"  Coverage: frames with valid pose = {len(pose_by_timestamp):,} (identity; no registration needed).")
     else:
         print("\n[3/7] Odom-anchored registration...")
-        pose_by_timestamp, _stats = run_odom_anchored_registration(selected_frames, odom_data, args)
+        pose_by_timestamp, _stats = run_odom_anchored_registration(pointclouds, odom_data, args)
 
     if not pose_by_timestamp:
         sys.exit("Error: Registration produced no usable poses.")
@@ -337,6 +376,11 @@ def run(args) -> None:
     # concatenation, shared with color_mesh.py) instead of Open3D's
     # `+`/`+=`, which would otherwise silently strip color from the entire
     # result whenever an uncolored frame was mixed with a colored one.
+    #
+    # NOTE: this loop iterates over the FULL raw `pointclouds` list and
+    # relies on `pose_by_timestamp.get(timestamp)` to skip any frame that
+    # motion gating, the odometry health check, or odometry-coverage
+    # filtering excluded -- selection is no longer pre-applied above.
     print(f"\n[4/7] Merging registered frames{' with color projection' if color_mode else ''}...")
     uncolored_frames: list[o3d.geometry.PointCloud] = []
     colored_frames: list[o3d.geometry.PointCloud] = []
@@ -344,7 +388,7 @@ def run(args) -> None:
     camera_colored_count = 0
     fallback_gray_count = 0
 
-    for timestamp, pcd_raw in selected_frames:
+    for timestamp, pcd_raw in pointclouds:
         transform_world = pose_by_timestamp.get(timestamp)
         if transform_world is None:
             continue
@@ -410,7 +454,7 @@ def run(args) -> None:
     pcd_combined = concat_point_clouds(merged_pieces)
 
     print(f"  Merge: {merged_frame_count:,} frame(s) actually merged into the combined cloud.")
-    del selected_frames, pose_by_timestamp
+    del pointclouds, pose_by_timestamp
 
     # -- Clean -------------------------------------------------------------
     print("\n[5/7] Cleaning merged cloud...")
@@ -442,7 +486,8 @@ def build_parser(sub):
     p.add_argument("outputdir", help="Output directory.")
 
     # Topics
-    p.add_argument("--pc_topic", default="points")
+    p.add_argument("--pc_topic", default="/points",
+                    help="PointCloud2 topic (default: /points).")
     p.add_argument("--odom_topic", default=None,
                     help=(
                         "Odometry topic. Required unless the point cloud is already "
@@ -473,11 +518,29 @@ def build_parser(sub):
     p.add_argument("--color_max_depth", type=float, default=None)
     p.add_argument("--gray_filter_radius", type=float, default=0.05,
                     help="Gray-fill points with a real-color neighbor within this "
-                         "radius (m) are removed. 0 = disable.")
+                    "radius (m) are removed. 0 = disable.")
 
     # Registration
     p.add_argument("--voxel_size", type=float, default=0.05)
     p.add_argument("--odom_max_latency", type=float, default=0.5)
+
+    p.add_argument(
+        "--min_move_distance", type=float, default=0.10,
+        help="Minimum translation (m), relative to the last KEPT registration frame's "
+        "odometry pose, required to keep a new frame. Replaces the old index-based "
+        "--frame_stride: odom is the primary pose source, so a frame that hasn't moved "
+        "(or turned) adds no new spatial coverage and is skipped instead of thinning "
+        "purely by message count. A frame is kept if EITHER this OR "
+        "--min_rotation_angle_deg is satisfied. Set to 0 to disable this half of the gate.",
+    )
+    p.add_argument(
+        "--min_rotation_angle_deg", type=float, default=5.0,
+        help="Minimum rotation (deg), relative to the last KEPT registration frame's "
+        "odometry pose, required to keep a new frame (OR'd with --min_move_distance). "
+        "Lets a robot that spins in place without translating still accumulate new "
+        "frames to cover the swept field of view. Set to 0 to disable this half of "
+        "the gate.",
+    )
 
     p.add_argument(
         "--enable_icp_refinement",
@@ -503,7 +566,7 @@ def build_parser(sub):
         help="Max allowed ICP correction rotation (degrees) relative to the odom guess.",
     )
     p.add_argument("--enable_loop_closure", action="store_true", default=False)
-    p.add_argument("--loop_closure_radius", type=float, default=10.0)
+    p.add_argument("--loop_closure_radius", type=float, default=3.0)
     p.add_argument(
         "--loop_closure_fitness_thresh", type=float, default=0.7,
         help="Defaults to the same bar as --icp_fitness_thresh, not a separate looser value.",
@@ -513,12 +576,36 @@ def build_parser(sub):
         "--loop_closure_temporal_window", type=int, default=100,
         help="Bounded number of most-recent candidate frames considered for loop closure.",
     )
-    p.add_argument("--frame_stride", type=int, default=1,
-                    help="Process every Nth frame.")
-    p.add_argument("--max_registration_frames", type=int, default=0,
-                    help="Cap total frames used for registration (0 = all).")
+    p.add_argument(
+        "--max_registration_frames", type=int, default=0,
+        help=(
+            "Cap total frames used for registration (0 = all). Bounds BOTH raw "
+            "frames read ahead of time AND the number of frames kept after the "
+            "motion gate and the odometry health check, applied in temporal order."
+        ))
     p.add_argument("--merge_chunk_frames", type=int, default=16,
                     help="Number of frames per merge chunk (reserved for future streaming use).")
+
+    p.add_argument(
+        "--disable_odom_health_check",
+        action="store_true",
+        default=False,
+        help="Disable the automatic odometry health check that truncates registration "
+        "at the first detected tracking loss/teleport (implied speed or rotation rate "
+        "far above the bag's own 95th-percentile baseline). Enabled by default so a "
+        "lost-odom segment cannot silently skew the output. The segment after a "
+        "detected loss is never auto-spliced back in.",
+    )
+    p.add_argument(
+        "--odom_loss_speed_multiplier",
+        type=float,
+        default=6.0,
+        help="Sensitivity of the odometry health check: a consecutive odometry sample "
+        "pair is flagged as a tracking loss/teleport if its implied linear speed OR "
+        "angular rate exceeds this multiplier times the bag's own 95th-percentile "
+        "baseline. Lower = more sensitive (may false-positive on genuinely fast "
+        "motion); higher = less sensitive. Ignored if --disable_odom_health_check is set.",
+    )
 
     # LOD / multi-layer output
     p.add_argument(
@@ -529,14 +616,15 @@ def build_parser(sub):
             f"{'/'.join(name for name, _ in DEFAULT_LOD_LEVELS)} order "
             "(default: 4.0,2.0,1.0). Each layer is voxel-downsampled at "
             "voxel_size * multiplier and written to its own "
-            "outputdir/tileset_<name>/ folder; a multiplier of 1.0 uses the "
+            "outputdir/tileset_/ folder; a multiplier of 1.0 uses the "
             "cloud's own (already-cleaned) resolution with no extra "
             "downsampling."
         ),
     )
 
     # Performance
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=1,
+                    help="Parallel workers for KDTree queries and py3dtiles convert.")
 
     p.set_defaults(func=run)
     return p
