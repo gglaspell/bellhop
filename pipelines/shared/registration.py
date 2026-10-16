@@ -2,7 +2,7 @@
 """
 registration.py - Shared odom-anchored registration + loop-closure helpers.
 
-Used by: mesh, color_mesh, gazebo_world, tiles_3d, color_tiles_3d.
+Used by: mesh, color_mesh, gazebo_world.
 NOT used by: og_map (uses OcTree ray-casting instead).
 
 Registration controls

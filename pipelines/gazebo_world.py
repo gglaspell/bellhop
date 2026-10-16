@@ -79,8 +79,8 @@ throughout the merge rather than only being reduced once at the very end.
 REFACTOR NOTE (shared chunked-merge helper):
 The chunked-merge helper this pipeline ported from `mesh.py` (above) was
 copy-pasted here as `_append_chunk()` -- byte-for-byte identical to
-`mesh.py`'s `append_chunk()` and to `tiles_3d.py`'s own independently
-copy-pasted `_append_chunk()`. All three copies now live in one place,
+`mesh.py`'s `append_chunk()` (and to a third copy in the since-removed
+`tiles_3d.py`). The copies now live in one place,
 `shared/merge_utils.py` (`merge_chunk()`), imported from there instead of
 redefined locally, so a future fix to the chunking logic only needs to be
 made once.

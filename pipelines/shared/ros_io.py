@@ -45,7 +45,6 @@ function's behavior exactly:
 """
 import bisect
 import logging
-import math
 import struct
 from io import BytesIO
 from pathlib import Path
@@ -62,7 +61,6 @@ logger = logging.getLogger(__name__)
 
 TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 _POINTFIELD_TO_DTYPE = {7: np.float32, 8: np.float64}
-_GPS_NO_FIX = -1
 
 # REP-105 fixed/global frame names (case-insensitive, leading "/" tolerated).
 _GLOBAL_FRAME_IDS = {"odom", "map", "world"}
@@ -421,43 +419,3 @@ def intrinsics_from_camera_info(msg):
     except (IndexError, ValueError, TypeError) as exc:
         logger.warning("CameraInfo message has malformed intrinsics matrix: %s", exc)
         return None
-
-
-def parse_gps_fixes(bag_path, gps_topic):
-    """Read all valid NavSatFix messages on gps_topic and return the mean (lat, lon, alt)."""
-    bag_path = Path(bag_path)
-    fixes = []
-    skipped = 0
-
-    with AnyReader([bag_path], default_typestore=TYPESTORE) as reader:
-        conns = [c for c in reader.connections if c.topic == gps_topic]
-        if not conns:
-            raise RuntimeError(f"GPS topic '{gps_topic}' not found in bag.")
-
-        for conn, _ts, raw in reader.messages(connections=conns):
-            try:
-                msg = reader.deserialize(raw, conn.msgtype)
-                if int(msg.status.status) == _GPS_NO_FIX:
-                    continue
-                lat, lon, alt = float(msg.latitude), float(msg.longitude), float(msg.altitude)
-                if all(math.isfinite(v) for v in (lat, lon, alt)):
-                    fixes.append((lat, lon, alt))
-                else:
-                    skipped += 1
-            except (AttributeError, ValueError, TypeError) as exc:
-                skipped += 1
-                logger.debug("Skipping malformed GPS message: %s", exc)
-                continue
-
-    if skipped:
-        logger.warning("Skipped %d malformed/invalid GPS messages on '%s'.", skipped, gps_topic)
-
-    if not fixes:
-        raise RuntimeError(f"No valid GPS fixes found on topic '{gps_topic}'.")
-
-    n = len(fixes)
-    lat0 = sum(f[0] for f in fixes) / n
-    lon0 = sum(f[1] for f in fixes) / n
-    alt0 = sum(f[2] for f in fixes) / n
-    logger.info("GPS: %d fix(es) averaged -> lat=%.7f lon=%.7f alt=%.3f m", n, lat0, lon0, alt0)
-    return lat0, lon0, alt0

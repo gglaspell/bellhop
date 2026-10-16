@@ -16,12 +16,10 @@ scipy>=1.10.0
 pyoctomap>=1.2.0
 PyYAML>=6.0
 
-# ── Image processing (color_mesh + color_tiles_3d pipelines) ──────────────
+# ── Image processing (color_mesh pipeline) ────────────────────────────────
 Pillow>=10.0.0
 
-# ── Georeferencing (tiles_3d + color_tiles_3d pipelines) ──────────────────
-pyproj>=3.5.0
-py3dtiles>=4.0.0
+# ── Mesh reconstruction / decimation (mesh, color_mesh, gazebo_world) ─────
 pymeshlab>=2023.12
 pyfqmr>=0.2.0
 
@@ -49,6 +47,11 @@ opencv-python-headless>=4.8.0
 # crash one line later at the unguarded fix_normals() call (see the
 # matching fix in meshgenerator.py's cull_invisible_faces()).
 networkx>=3.0
+
+# viewassignment.py (texture_baking) imports matplotlib.pyplot at module
+# level; without it the texture_baking pipeline reports
+# "unavailable - missing dependency: No module named 'matplotlib'".
+matplotlib>=3.7.0
 
 # ── Progress bars ─────────────────────────────────────────────────────────
 tqdm>=4.65.0

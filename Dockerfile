@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     libopengl0 \
     libspatialindex-dev \
+    libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python venv (avoids PEP 668 externally-managed-environment error) ──────

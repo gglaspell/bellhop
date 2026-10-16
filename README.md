@@ -1,15 +1,14 @@
 # 🛎️ bellhop
 
-**bellhop** converts ROS 2 bag files into spatial outputs: Nav2 occupancy maps, Poisson meshes, Gazebo worlds, georeferenced Cesium 3D Tiles, and keyframe-baked textured meshes. Use the Docker-backed CLI or the host-native Tk GUI.
+**bellhop** converts ROS 2 bag files into spatial outputs: Nav2 occupancy maps, Poisson meshes, Gazebo worlds, and keyframe-baked textured meshes. Use the Docker-backed CLI or the host-native Tk GUI.
 
 ## Features
 
-- Seven pipelines behind one CLI: `og_map`, `mesh`, `color_mesh`, `gazebo_world`, `tiles_3d`, `color_tiles_3d`, and `texture_baking`.
+- Five pipelines behind one CLI: `og_map`, `mesh`, `color_mesh`, `gazebo_world`, and `texture_baking`.
 - Automatic point-cloud frame handling. `--pc_frame_mode auto` detects fixed/global (`odom`, `map`, or `world`) versus moving/local cloud frames; use `global` or `local` to override detection.
-- Odometry-anchored registration for mesh, color-mesh, Gazebo, and Tiles pipelines. ICP refinement and loop closure are optional, correction-gated refinements—not the primary pose source.
+- Odometry-anchored registration for the mesh, color-mesh, and Gazebo pipelines. ICP refinement and loop closure are optional, correction-gated refinements—not the primary pose source.
 - Motion-gated frame selection (`--min_move_distance`, `--min_rotation_angle_deg`) replaces the old registration `--frame_stride` behavior. An odometry health check stops processing at an apparent tracking-loss/teleport segment by default.
 - Memory-bounded chunked merging controlled by `--merge_chunk_frames` for the registration-based pipelines.
-- Three Cesium Tiles detail layers—`coarse`, `medium`, and `fine`—with configurable voxel multipliers.
 - Camera-color workflows preserve per-vertex colors and explicitly use neutral-gray fallback when a frame cannot be projected from a camera image.
 - A host-native GUI with pipeline-specific forms, topic pre-flight checks, a live Docker log, and light/dark themes.
 
@@ -77,8 +76,6 @@ docker run --rm bellhop:latest mesh --help
 | `mesh` | PointCloud2; Odometry for local clouds | `<bag>_cloud.ply`, `<bag>_mesh.ply`, optional height-colored PLY |
 | `color_mesh` | PointCloud2, Image/CompressedImage, CameraInfo; Odometry for local clouds | `<bag>_colored_cloud.ply`, `<bag>_colored_mesh.ply` |
 | `gazebo_world` | PointCloud2; Odometry for local clouds | STL mesh, `model.config`, `model.sdf`, and Gazebo `.world` |
-| `tiles_3d` | PointCloud2, NavSatFix; Odometry for local clouds | Three georeferenced Cesium Tiles layers |
-| `color_tiles_3d` | PointCloud2, NavSatFix; camera topics are optional; Odometry for local clouds | Three colored Cesium Tiles layers when camera data is available |
 | `texture_baking` | PointCloud2, Image/CompressedImage, CameraInfo, Odometry | Keyframe-baked OBJ mesh and PNG texture in an output workspace |
 
 ### Frame handling and registration
@@ -93,7 +90,7 @@ All pipelines support:
 - `global` streams points without per-frame pose transformation or registration.
 - `local` transforms clouds into the world frame using interpolated odometry. It requires `--odom_topic`.
 
-`og_map` and `texture_baking` use odometry directly when a local transform is needed; they do not have ICP or loop closure. The other five pipelines use odometry as the primary motion estimate and may optionally enable correction-gated ICP:
+`og_map` and `texture_baking` use odometry directly when a local transform is needed; they do not have ICP or loop closure. The other three pipelines use odometry as the primary motion estimate and may optionally enable correction-gated ICP:
 
 ```text
 --enable_icp_refinement
@@ -174,16 +171,6 @@ worlds/<model_name>.world
 
 Configure `--model_name`, `--gazebo_material`, and `--level_floor` as needed.
 
-### `tiles_3d` and `color_tiles_3d`
-
-Both Tiles pipelines use NavSatFix data as an ENU origin, convert the cleaned cloud to ECEF, and write three Tiles layers. Customize their relative voxel resolutions with:
-
-```text
---lod_multipliers 4.0,2.0,1.0
-```
-
-The values correspond to the `coarse`, `medium`, and `fine` layers, respectively. `color_tiles_3d` can run without camera data and will produce XYZ-only tiles; provide both `--camera_topic` and `--camera_info_topic` to create colored tiles.
-
 ### `texture_baking`
 
 This pipeline selects well-spaced camera keyframes, filters and reconstructs a mesh, assigns faces to camera views, packs a UV atlas, and bakes a PNG texture. Odometry is always required.
@@ -205,7 +192,7 @@ The final artifacts are `<bag>_baked_mesh.obj` and `<bag>_baked_mesh_texture.png
 
 Run `python3 gui.py` from the repository root. The GUI:
 
-- Provides profiles in this order: OG Map, Mesh, 3D Tiles, Gazebo World, Color Mesh, Color Tiles, and Texture Baking
+- Provides profiles in this order: OG Map, Mesh, Gazebo World, Color Mesh, and Texture Baking
 - Maps host bag and output paths to `/data/bag` and `/data/output` automatically
 - Lets you select a Docker image tag
 - Checks the selected profile's required ROS topics in a short-lived container before running
@@ -222,7 +209,7 @@ For `og_map`, the GUI passes an output base path under `/data/output/occupancy_m
 - `color_mesh` no longer supports `--remesh` or `--remesh_smooth_iterations`, preserving camera-derived vertex color.
 - `texture_baking` no longer creates an ATAK zip or ATAK-specific package. It stops after writing the baked OBJ and PNG texture.
 - `texture_baking` does not accept camera-projection color options (`--max_time_diff`, `--color_min_depth`, `--color_max_depth`, or `--gray_filter_radius`) or remeshing options.
-- Cesium output is no longer a single fixed-resolution tileset: it is produced as three configurable LOD layers.
+- The `tiles_3d` and `color_tiles_3d` pipelines (Cesium 3D Tiles output), their GUI profiles, and the `py3dtiles`/`pyproj` dependencies were removed.
 - `og_map`'s `--octree_discretize` now defaults to **off** (previously on). The `pyoctomap` build pinned in the Docker image crashes with `AttributeError: 'OcTreeKey' object has no attribute 'thisptr'` whenever `insertPointCloud()` is called with `discretize=True`. The flag still exists — pass `--octree_discretize` explicitly to re-enable it, and expect it to crash until that upstream `pyoctomap` bug is fixed. The GUI's OG Map profile checkbox for this option is unchecked by default to match.
 
 ## Project layout
@@ -238,8 +225,6 @@ bellhop/
     ├── mesh.py
     ├── color_mesh.py
     ├── gazebo_world.py
-    ├── tiles_3d.py
-    ├── color_tiles_3d.py
     ├── texture_baking.py
     ├── atlas_pipeline/
     └── shared/

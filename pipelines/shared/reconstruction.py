@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import Optional
 
 import numpy as np
@@ -249,15 +248,3 @@ def level_floor(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     except Exception as exc:
         logging.warning("Floor levelling failed: %s", exc)
     return pcd
-
-
-def _enu_to_ecef_rotation(lat_deg: float, lon_deg: float) -> np.ndarray:
-    lat, lon = math.radians(lat_deg), math.radians(lon_deg)
-    sl, cl, so, co = math.sin(lat), math.cos(lat), math.sin(lon), math.cos(lon)
-    return np.array([[-so, co, 0], [-sl * co, -sl * so, cl], [cl * co, cl * so, sl]], dtype=np.float64)
-
-
-def transform_local_enu_to_ecef(pts_enu: np.ndarray, lat0_deg: float, lon0_deg: float, alt0_m: float) -> np.ndarray:
-    from pyproj import CRS, Transformer
-    x, y, z = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_epsg(4978), always_xy=True).transform(lon0_deg, lat0_deg, alt0_m)
-    return np.asarray(pts_enu, dtype=np.float64) @ _enu_to_ecef_rotation(lat0_deg, lon0_deg).T + np.array([x, y, z])

@@ -1,9 +1,10 @@
 """
 shared/color_projection.py - Camera-image point-cloud coloring helpers
-shared by `color_mesh.py` and `color_tiles_3d.py`.
+used by `color_mesh.py`.
 
 REFACTOR NOTE (overlap consolidation):
-`color_mesh.py` and `color_tiles_3d.py` both independently implemented:
+`color_mesh.py` and the since-removed `color_tiles_3d.py` both
+independently implemented:
   - the same FALLBACK_GRAY constant,
   - the same pinhole camera-projection coloring math
     (`_color_pcd_from_image`),
@@ -17,13 +18,9 @@ REFACTOR NOTE (overlap consolidation):
     lacks a colors array (or the arrays mismatch length).
 
 Any bugfix to any of these had to be applied twice by hand, which is
-exactly how `color_tiles_3d.py` ended up missing the total-color-loss fix
-that had already landed in `color_mesh.py` (see color_tiles_3d.py's own
-BUGFIX note history). Centralizing them here means a future fix only
-needs to be made once, and both pipelines' "is this a placeholder gray"
-detection is guaranteed to stay in lockstep since they call the same
-function instead of two independently-maintained copies of the same
-threshold.
+exactly how the removed tiles pipeline ended up missing a total-color-loss
+fix that had already landed in `color_mesh.py`. Keeping them here means a
+future fix only needs to be made in one place.
 """
 
 from __future__ import annotations

@@ -5,22 +5,40 @@ gui.py - Bellhop graphical launcher.
 The GUI runs on the host. Pre-flight checks and all pipelines run
 inside the configured Bellhop Docker image.
 
+PATCH NOTE (topic autofill, ported from bag2ATAK's gui.py):
+Added an "Autofill Topics" button (see `_run_autofill_topics()` /
+`_apply_autofill()`), placed in its own row directly under the
+"PARAMETERS" header since it populates fields in that section. It scans
+the bag in Docker (same pattern as `_run_preflight`) via
+`list_topics_by_type()` in `pipelines/shared/preflight.py`, which reads
+each connection's topic + message type off the bag's connection table
+(no message deserialization). Every topic-picker field (`pc_topic`,
+`odom_topic`, `camera_topic`, `camera_info_topic`) is now a
+"topic_combobox": an EDITABLE combobox whose dropdown is populated with
+matching topics after a scan, per `_TOPIC_TYPE_HINTS`. A field with
+exactly one matching topic is auto-filled when it is blank OR holds a
+value that does not exist in the bag (e.g. a preset such as "/points"
+or "/odom" on a bag that names the topic differently). A value
+that DOES exist in the bag is never overwritten, so presets that already
+match stay put and hand-typed valid topics are respected; with several
+matches only the dropdown is populated. Typing a topic by hand still
+works exactly as before. The Docker image must be rebuilt so it contains
+the new `list_topics_by_type()`.
+
 PATCH NOTE (odom-anchored registration + frame-awareness wiring):
 See odom-anchored-registration-fix-prompt.md and
-pointcloud-frame-check-prompt-2.md. `mesh`, `color_mesh`, `gazebo_world`,
-`tiles_3d`, and `color_tiles_3d` were migrated to odom-anchored
-registration with optional/gated ICP refinement and REP-105 frame
+pointcloud-frame-check-prompt-2.md. `mesh`, `color_mesh`, and `gazebo_world`
+were migrated to odom-anchored registration with optional/gated ICP refinement and REP-105 frame
 detection. `og_map` and `texture_baking` were separately given REP-105
 frame detection (with odom-anchored local-frame point transformation, but
 no ICP/loop-closure -- neither ever had a registration step to begin
-with). This file wires the relevant new flags through to all seven
+with). This file wires the relevant new flags through to all five
 profiles so the CLI commands the GUI builds actually use them end to end.
 
 PATCH NOTE (motion-gated frame selection + odometry health check wiring):
-Ported from `mesh.py`/`color_mesh.py`/`gazebo_world.py`/`tiles_3d.py`/
-`color_tiles_3d.py` (see `shared/registration.py` for the full design).
+Ported from `mesh.py`/`color_mesh.py`/`gazebo_world.py` (see `shared/registration.py` for the full design).
 `--frame_stride` has been removed from `_COMMON_REGISTRATION` -- it no
-longer exists on any of the five pipelines that share that param group,
+longer exists on any of the three pipelines that share that param group,
 so the GUI could never have sent it without the pipeline rejecting it as
 an unrecognized argument. In its place, `_COMMON_REGISTRATION` now
 includes `min_move_distance`/`min_rotation_angle_deg` (motion-gated frame
@@ -73,7 +91,7 @@ re-enable the speedup.
 
 BUGFIX (Texture Baking profile sent unrecognized arguments):
 The Texture Baking profile previously reused `_COMMON_COLOR` (built for
-the camera-*projection*-coloring pipelines `color_mesh`/`color_tiles_3d`:
+the camera-*projection*-coloring pipeline `color_mesh`:
 `max_time_diff`, `color_min_depth`, `color_max_depth`,
 `gray_filter_radius`) and included explicit `remesh`/
 `remesh_smooth_iterations` fields. `texture_baking.py`'s actual
@@ -101,17 +119,22 @@ false-color pass runs as a *separate* post-process on the already-
 remeshed output file) still includes `_REMESH_OPTIONS`. The "Color Mesh"
 profile no longer does, so the GUI can never send `--remesh` /
 `--remesh_smooth_iterations` to a pipeline that would reject them as
-unrecognized arguments. "Color Tiles" (`color_tiles_3d`) never had a mesh
-step or a remesh flag in the first place -- it was never affected.
+unrecognized arguments.
 
 PATCH NOTE (sidebar pipeline order):
 The `PROFILES` dict's insertion order drives the sidebar button order
 (see `_build_layout`'s `for profile_name in PROFILES:` loop) and the
 "first profile selected on launch" default (`list(PROFILES.keys())[0]`
-in `BellhopGUI.__init__`). Reordered to: OG Map, Mesh, 3D Tiles, Gazebo
-World, Color Mesh, Color Tiles, Texture Baking. This is purely a display/
+in `BellhopGUI.__init__`). Order is now: OG Map, Mesh, Gazebo World,
+Color Mesh, Texture Baking. This is purely a display/
 default-selection change -- no profile's `params`, `pipeline` name, or
 `required_topics_fields` were altered.
+
+PATCH NOTE (3D Tiles pipelines removed):
+The `tiles_3d` and `color_tiles_3d` pipelines were removed from Bellhop.
+The "3D Tiles" and "Color Tiles" profiles, the `_GPS_TOPIC` param group,
+and the `gps_topic` entry in `_TOPIC_TYPE_HINTS` (nothing else used a
+NavSatFix topic) were removed with them. The GUI now has five profiles.
 
 PATCH NOTE (ATAK references removed from Texture Baking):
 `texture_baking.py` no longer packages its output into an ATAK-compatible
@@ -125,6 +148,7 @@ unconditional in the old pipeline, not a flag).
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import subprocess
@@ -135,11 +159,32 @@ from tkinter import filedialog, font, scrolledtext, ttk
 
 logger = logging.getLogger(__name__)
 
+# Maps each topic-picker argument to the ROS message type string(s) that make
+# a bag topic a candidate for it. Both ROS 2 ("nav_msgs/msg/Odometry") and
+# legacy ROS 1-style ("nav_msgs/Odometry") type strings are listed since
+# `rosbags` can surface either depending on the bag/typestore.
+_TOPIC_TYPE_HINTS: dict[str, tuple[str, ...]] = {
+    "pc_topic": ("sensor_msgs/msg/PointCloud2", "sensor_msgs/PointCloud2"),
+    "odom_topic": ("nav_msgs/msg/Odometry", "nav_msgs/Odometry"),
+    "camera_topic": (
+        "sensor_msgs/msg/Image",
+        "sensor_msgs/Image",
+        "sensor_msgs/msg/CompressedImage",
+        "sensor_msgs/CompressedImage",
+    ),
+    "camera_info_topic": ("sensor_msgs/msg/CameraInfo", "sensor_msgs/CameraInfo"),
+}
+
+
+def _topic_type_matches(msgtype: str, hints: tuple[str, ...]) -> bool:
+    """True if `msgtype` exactly matches, or contains, one of `hints`."""
+    return any(hint == msgtype or hint in msgtype for hint in hints)
+
 # ---------------------------------------------------------------------------
 # Shared param groups
 # ---------------------------------------------------------------------------
 
-# PATCH: `frame_stride` removed (no longer exists on any of the five
+# PATCH: `frame_stride` removed (no longer exists on any of the three
 # pipelines that share this group -- see the PATCH NOTE at the top of this
 # file). `min_move_distance`/`min_rotation_angle_deg` (motion-gated frame
 # selection) and `disable_odom_health_check`/`odom_loss_speed_multiplier`
@@ -209,7 +254,7 @@ _COMMON_REGISTRATION = [
 ]
 
 # Used by every pipeline that has REP-105 frame detection wired up:
-# mesh, color_mesh, gazebo_world, tiles_3d, color_tiles_3d (odom-anchored
+# mesh, color_mesh, gazebo_world (odom-anchored
 # registration + frame detection); og_map and texture_baking (frame
 # detection + odom-anchored local-frame point transform, no ICP/loop
 # closure in either).
@@ -283,27 +328,23 @@ _HEIGHT_FALSE_COLOR = [
 ]
 
 _COMMON_TOPICS = [
-    ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
-    ("odom_topic", "Odometry topic", "entry", "", {}),
+    ("pc_topic", "PointCloud2 topic", "topic_combobox", "/points", {}),
+    ("odom_topic", "Odometry topic", "topic_combobox", "", {}),
 ]
 
-# Used only by the camera-PROJECTION-coloring pipelines (color_mesh,
-# color_tiles_3d), which color individual points by projecting a camera
+# Used only by the camera-PROJECTION-coloring pipeline (color_mesh),
+# which color individual points by projecting a camera
 # image onto them per-frame. texture_baking does NOT use this group -- it
 # has no per-point projection step (it bakes a UV atlas from keyframe view
 # assignment instead), so none of these four fields apply there. See the
 # BUGFIX note above.
 _COMMON_COLOR = [
-    ("camera_topic", "Camera topic", "entry", "", {}),
-    ("camera_info_topic", "CameraInfo topic", "entry", "", {}),
+    ("camera_topic", "Camera topic", "topic_combobox", "", {}),
+    ("camera_info_topic", "CameraInfo topic", "topic_combobox", "", {}),
     ("max_time_diff", "Max time difference (s)", "entry", "0.1", {}),
     ("color_min_depth", "Color minimum depth (m)", "entry", "0.1", {}),
     ("color_max_depth", "Color maximum depth (m)", "entry", "", {}),
     ("gray_filter_radius", "Gray filter radius (m)", "entry", "0.05", {}),
-]
-
-_GPS_TOPIC = [
-    ("gps_topic", "GPS/NavSatFix topic", "entry", "/gps/fix", {}),
 ]
 
 # PATCH: OcTree insertion perf flags for OG Map (see PATCH NOTE above).
@@ -344,8 +385,8 @@ PROFILES = {
         "required_topics_fields": ["pc_topic", "odom_topic"],
         "params": (
             [
-                ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
-                ("odom_topic", "Odometry topic", "entry", "/odom", {}),
+                ("pc_topic", "PointCloud2 topic", "topic_combobox", "/points", {}),
+                ("odom_topic", "Odometry topic", "topic_combobox", "/odom", {}),
             ]
             + _PC_FRAME_MODE
             + [
@@ -414,22 +455,14 @@ PROFILES = {
             + _HEIGHT_FALSE_COLOR
         ),
     },
-    "3D Tiles": {
-        "pipeline": "tiles_3d",
-        "description": "Georeferenced Cesium 3D Tiles -> tileset.json",
-        "required_topics_fields": ["pc_topic", "gps_topic"],
-        "params": (
-            _COMMON_TOPICS + _PC_FRAME_MODE + _GPS_TOPIC + _COMMON_REGISTRATION
-        ),
-    },
     "Gazebo World": {
         "pipeline": "gazebo_world",
         "description": "Gazebo simulation world -> .stl + .sdf + .world",
         "required_topics_fields": ["pc_topic"],
         "params": (
             [
-                ("pc_topic", "PointCloud2 topic", "entry", "/points", {}),
-                ("odom_topic", "Odometry topic", "entry", "", {}),
+                ("pc_topic", "PointCloud2 topic", "topic_combobox", "/points", {}),
+                ("odom_topic", "Odometry topic", "topic_combobox", "", {}),
             ]
             + _PC_FRAME_MODE
             + [
@@ -477,21 +510,6 @@ PROFILES = {
             + _COMMON_RECONSTRUCTION
         ),
     },
-    "Color Tiles": {
-        "pipeline": "color_tiles_3d",
-        "description": "Coloured georeferenced Cesium 3D Tiles -> tileset.json",
-        "required_topics_fields": ["pc_topic", "gps_topic"],
-        # No remesh group here, and never was -- color_tiles_3d.py
-        # produces a colored point cloud, not a mesh, so it has no
-        # reconstruction/remesh step or CLI flag at all.
-        "params": (
-            _COMMON_TOPICS
-            + _PC_FRAME_MODE
-            + _GPS_TOPIC
-            + _COMMON_COLOR
-            + _COMMON_REGISTRATION
-        ),
-    },
     "Texture Baking": {
         "pipeline": "texture_baking",
         # PATCH: was "Keyframe-baked textured mesh (ATAK zip)" -- the
@@ -514,10 +532,10 @@ PROFILES = {
         # never exposed at all.
         "params": (
             [
-                ("pc_topic", "PointCloud2 topic", "entry", "points", {}),
-                ("camera_topic", "Camera topic", "entry", "", {}),
-                ("camera_info_topic", "CameraInfo topic", "entry", "", {}),
-                ("odom_topic", "Odometry topic", "entry", "", {}),
+                ("pc_topic", "PointCloud2 topic", "topic_combobox", "points", {}),
+                ("camera_topic", "Camera topic", "topic_combobox", "", {}),
+                ("camera_info_topic", "CameraInfo topic", "topic_combobox", "", {}),
+                ("odom_topic", "Odometry topic", "topic_combobox", "", {}),
             ]
             + _PC_FRAME_MODE
             + [
@@ -662,6 +680,7 @@ class BellhopGUI:
         self.palette = LIGHT
         self.current_profile = list(PROFILES.keys())[0]
         self.param_vars: dict[str, tk.Variable] = {}
+        self._topic_comboboxes: dict[str, ttk.Combobox] = {}
         self.sidebar_buttons: dict[str, tk.Button] = {}
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.running = False
@@ -852,6 +871,7 @@ class BellhopGUI:
             widget.destroy()
 
         self.param_vars.clear()
+        self._topic_comboboxes.clear()
         profile = PROFILES[self.current_profile]
 
         tk.Label(
@@ -868,7 +888,38 @@ class BellhopGUI:
         self._build_docker_image_row(3)
 
         self._section_label(4, "Parameters")
-        row = 5
+
+        # "Autofill Topics" lives directly under the Parameters header (not
+        # the Pre-flight row) since it populates fields IN that section --
+        # see `_run_autofill_topics` / `_apply_autofill`.
+        autofill_frame = tk.Frame(self.form_frame)
+        autofill_frame.grid(
+            row=5,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            padx=16,
+            pady=(0, 6),
+        )
+        self.autofill_button = tk.Button(
+            autofill_frame,
+            text="Autofill Topics",
+            font=self.font_body,
+            relief="flat",
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=self._run_autofill_topics,
+        )
+        self.autofill_button.pack(side="left")
+        tk.Label(
+            autofill_frame,
+            text="Scans the bag and fills in the topic fields below.",
+            font=self.font_small,
+            padx=8,
+        ).pack(side="left")
+
+        row = 6
 
         for argument, label, widget_type, default, extra in profile["params"]:
             row = self._build_param_row(
@@ -1077,6 +1128,30 @@ class BellhopGUI:
                 width=24,
             ).grid(row=row, column=1, sticky="w", pady=2)
 
+        elif widget_type == "topic_combobox":
+            # Editable (state="normal", NOT "readonly") so a topic typed by
+            # hand -- before scanning, or one the scan did not recognize --
+            # is still accepted. Dropdown values are filled in by
+            # `_apply_autofill` after "Autofill Topics" scans the bag.
+            variable = tk.StringVar(value="" if default is None else str(default))
+            combobox = ttk.Combobox(
+                self.form_frame,
+                textvariable=variable,
+                values=(),
+                font=self.font_body,
+                state="normal",
+                width=24,
+            )
+            combobox.grid(
+                row=row,
+                column=1,
+                columnspan=2,
+                sticky="ew",
+                padx=(0, 16),
+                pady=2,
+            )
+            self._topic_comboboxes[argument] = combobox
+
         else:
             variable = tk.StringVar(
                 value=str(default) if default is not None else ""
@@ -1194,6 +1269,153 @@ class BellhopGUI:
                 ))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _run_autofill_topics(self) -> None:
+        """Scan the bag (in Docker) and populate the topic comboboxes.
+
+        Uses `list_topics_by_type()` (pipelines/shared/preflight.py) to get
+        {msgtype: [topic, ...]}, then matches each topic field against
+        `_TOPIC_TYPE_HINTS`. Dropdowns are always populated; a field is
+        auto-filled when exactly one topic matches and the field is blank or
+        holds a topic that does not exist in the bag. Values that exist in
+        the bag are kept.
+        """
+        bag_path = self.param_vars.get("bag_path", tk.StringVar()).get().strip()
+
+        if not bag_path:
+            self._set_preflight("\u26a0 No bag path set.", "warning")
+            return
+
+        bag_dir = Path(bag_path).expanduser().resolve()
+
+        if not bag_dir.is_dir():
+            self._set_preflight("\u2717 Bag directory does not exist.", "error")
+            return
+
+        self._set_preflight("Scanning bag topics...", "muted")
+        try:
+            self.autofill_button.configure(state="disabled")
+        except tk.TclError as exc:
+            logger.debug("Could not disable autofill button: %s", exc)
+
+        image = self.docker_image.get().strip() or "bellhop:latest"
+        scan_code = (
+            "import json\n"
+            "from pathlib import Path\n"
+            "from pipelines.shared.preflight import list_topics_by_type\n"
+            "print(json.dumps(list_topics_by_type(Path('/data/bag'))))"
+        )
+
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{bag_dir}:/data/bag:ro",
+            "--entrypoint",
+            "python",
+            image,
+            "-c",
+            scan_code,
+        ]
+
+        def worker() -> None:
+            try:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                output = completed.stdout.strip()
+
+                if completed.returncode != 0:
+                    self.log_queue.put((
+                        "autofill_error",
+                        output or "Docker topic scan failed.",
+                    ))
+                    return
+                if not output:
+                    self.log_queue.put((
+                        "autofill_error",
+                        "Topic scan produced no output.",
+                    ))
+                    return
+                # The JSON is expected to be the last line of stdout; any
+                # incidental warnings printed before it are harmless noise.
+                self.log_queue.put(("autofill_ok", output.splitlines()[-1]))
+
+            except FileNotFoundError:
+                self.log_queue.put((
+                    "autofill_error",
+                    "Docker was not found on PATH.",
+                ))
+            except (subprocess.SubprocessError, OSError) as exc:
+                self.log_queue.put((
+                    "autofill_error",
+                    f"Topic scan failed: {exc}",
+                ))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_autofill(self, topics_by_type: dict[str, list[str]]) -> None:
+        scanned: list[str] = []
+        filled: list[str] = []
+        all_topics = {t for topics in topics_by_type.values() for t in topics}
+
+        for argument, hints in _TOPIC_TYPE_HINTS.items():
+            combobox = self._topic_comboboxes.get(argument)
+            if combobox is None:
+                continue  # field not present in the current profile
+
+            matches = sorted(
+                {
+                    topic
+                    for msgtype, topics in topics_by_type.items()
+                    if _topic_type_matches(msgtype, hints)
+                    for topic in topics
+                }
+            )
+            if not matches:
+                continue
+
+            try:
+                combobox["values"] = matches
+            except tk.TclError as exc:
+                logger.debug("Combobox for %s is gone: %s", argument, exc)
+                continue
+
+            scanned.append(argument)
+            variable = self.param_vars.get(argument)
+            if variable is None or len(matches) != 1:
+                continue
+            current = str(variable.get()).strip()
+            # Fill when blank, or when the current value (e.g. a profile
+            # preset such as "/points") is not a topic that exists in this
+            # bag at all. A value that IS present in the bag is never touched.
+            if not current or current not in all_topics:
+                variable.set(matches[0])
+                filled.append(argument)
+
+        if scanned:
+            message = f"Found topics for: {', '.join(scanned)}"
+            if filled:
+                message += f" (auto-filled: {', '.join(filled)})"
+            self._set_preflight(f"\u2713 {message}", "ok")
+            self._log(message + "\n", "ok")
+        else:
+            self._set_preflight(
+                "\u26a0 No recognizable topics found in this bag.",
+                "warning",
+            )
+            self._log("Autofill scan found no recognizable topic types.\n", "warning")
+
+    def _finish_autofill_button(self) -> None:
+        try:
+            self.autofill_button.configure(state="normal")
+        except (tk.TclError, AttributeError) as exc:
+            logger.debug("Could not re-enable autofill button: %s", exc)
 
     def _set_preflight(self, message: str, style: str) -> None:
         colors = self.palette
@@ -1381,6 +1603,30 @@ class BellhopGUI:
                 elif kind == "preflight_error":
                     self._set_preflight(f"\u2717 {text}", "error")
                     self._log(f"Pre-flight FAIL: {text}\n", "error")
+
+                elif kind == "autofill_ok":
+                    self._finish_autofill_button()
+                    try:
+                        topics_by_type = json.loads(text)
+                        if not isinstance(topics_by_type, dict):
+                            raise ValueError("expected a JSON object")
+                    except ValueError as exc:  # JSONDecodeError subclasses ValueError
+                        self._set_preflight(
+                            "\u2717 Could not parse topic scan output.",
+                            "error",
+                        )
+                        self._log(
+                            f"Autofill FAIL: could not parse scan output ({exc}): "
+                            f"{text}\n",
+                            "error",
+                        )
+                    else:
+                        self._apply_autofill(topics_by_type)
+
+                elif kind == "autofill_error":
+                    self._finish_autofill_button()
+                    self._set_preflight(f"\u2717 {text}", "error")
+                    self._log(f"Autofill FAIL: {text}\n", "error")
 
                 elif kind == "done_ok":
                     self._log(text, "ok")

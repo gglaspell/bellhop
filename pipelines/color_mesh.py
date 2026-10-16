@@ -62,7 +62,7 @@ REFACTOR NOTE (shared color-projection helpers):
 The camera-projection coloring math, the fallback-gray guarantee, the
 "is this pixel a placeholder gray" heuristic, and the Open3D
 `+`/`+=`-avoiding merge helper were previously duplicated almost verbatim
-in `color_tiles_3d.py`. They now live in `shared/color_projection.py` (see
+in the since-removed `color_tiles_3d.py`. They now live in `shared/color_projection.py` (see
 that module's docstring) and are imported from there, so a future bugfix
 to any of them only needs to be made once. Only the streaming/chunked
 merge control flow -- which is specific to this pipeline's two-pass,

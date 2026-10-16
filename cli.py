@@ -34,8 +34,6 @@ def main() -> None:
             "  mesh            Poisson surface mesh (.ply cloud + .ply mesh)\n"
             "  color_mesh      Camera-colored Poisson mesh (.ply cloud + .ply mesh)\n"
             "  gazebo_world    Gazebo simulation world (.stl + .sdf + .world)\n"
-            "  tiles_3d        Georeferenced Cesium 3D Tiles (tileset.json)\n"
-            "  color_tiles_3d  Colored georeferenced Cesium 3D Tiles\n"
             "  texture_baking  Keyframe-baked textured mesh (OBJ + texture)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -54,8 +52,6 @@ def main() -> None:
         ("mesh", "pipelines.mesh"),
         ("color_mesh", "pipelines.color_mesh"),
         ("gazebo_world", "pipelines.gazebo_world"),
-        ("tiles_3d", "pipelines.tiles_3d"),
-        ("color_tiles_3d", "pipelines.color_tiles_3d"),
         ("texture_baking", "pipelines.texture_baking"),
     ]
 

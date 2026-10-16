@@ -1,11 +1,12 @@
 """
 shared/merge_utils.py - Bounded, chunked point-cloud merge helper shared by
-`mesh.py`, `gazebo_world.py`, and `tiles_3d.py`.
+`mesh.py` and `gazebo_world.py`.
 
 REFACTOR NOTE (overlap consolidation):
-All three pipelines independently defined the exact same function --
-`append_chunk()` in mesh.py, `_append_chunk()` in gazebo_world.py and
-tiles_3d.py -- byte-for-byte identical bodies:
+Both pipelines independently defined the exact same function --
+`append_chunk()` in mesh.py and `_append_chunk()` in gazebo_world.py --
+byte-for-byte identical bodies (a third copy lived in the since-removed
+tiles_3d pipeline):
 
     def _append_chunk(target, chunk, voxel_size):
         if not chunk:
@@ -24,20 +25,18 @@ This is the "batch frames into a bounded list, concatenate + voxel-reduce
 every --merge_chunk_frames frames" pattern that keeps a streaming merge's
 accumulated point count close to its true (deduplicated) size throughout
 the merge, instead of growing unboundedly and only being reduced once at
-the very end (see gazebo_world.py's/tiles_3d.py's own PERF FIX notes,
-which independently diagnosed and fixed the identical O(n^2)-trending
-merge cost by porting mesh.py's pattern -- by hand, in two separate
-files). Centralizing it here means any future fix to the chunking logic
-itself only needs to be made once, and all three pipelines are
+the very end (see gazebo_world.py's own PERF FIX note, which diagnosed and fixed
+the identical O(n^2)-trending merge cost by porting mesh.py's pattern). Centralizing it here means any future fix to the chunking logic
+itself only needs to be made once, and both pipelines are
 guaranteed to keep behaving identically.
 
-NOTE ON SCOPE: `color_mesh.py`/`color_tiles_3d.py` do NOT use this helper.
+NOTE ON SCOPE: `color_mesh.py` does NOT use this helper.
 Their merge chunks may contain per-point colors that must never be
 combined with Open3D's `+`/`+=` (see `shared/color_projection.py`'s
 docstring for why), so they use `color_projection.concat_point_clouds()`
 instead, which explicitly avoids `+`/`+=` for that reason. This helper is
-for the plain (uncolored) point-cloud merges in `mesh.py`, `gazebo_world.py`,
-and `tiles_3d.py`, where every chunk's clouds are guaranteed to either all
+for the plain (uncolored) point-cloud merges in `mesh.py` and
+`gazebo_world.py`, where every chunk's clouds are guaranteed to either all
 carry colors/normals or none do, so `+`/`+=` is safe as originally written.
 
 NOTE ON SCOPE: `texture_baking.py` does NOT use this helper either. It
