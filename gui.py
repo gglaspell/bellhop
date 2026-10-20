@@ -363,9 +363,9 @@ _OCTREE_PERF = [
     ("octree_lazy_eval", "OcTree lazy-eval inner-node update", "check", True, {}),
     (
         "octree_discretize",
-        "OcTree discretize scan before insertion (off: pyoctomap crash)",
+        "OcTree discretize scan before insertion ",
         "check",
-        False,
+        True,
         {},
     ),
 ]

@@ -201,17 +201,6 @@ Run `python3 gui.py` from the repository root. The GUI:
 
 For `og_map`, the GUI passes an output base path under `/data/output/occupancy_map`; all other pipelines receive `/data/output` as their output directory. The OG Map profile's "OcTree discretize scan before insertion" checkbox is unchecked by default, matching `og_map.py`'s own default — see the `--octree_discretize` note under [`og_map` — Nav2 occupancy grid](#og_map--nav2-occupancy-grid) before enabling it.
 
-## Changes from earlier versions
-
-- Registration-based pipelines no longer accept registration `--frame_stride`; use movement/rotation thresholds instead. `og_map` retains its independent index-based `--frame_stride` and `--max_frames` controls.
-- `mesh` and `color_mesh` no longer write OBJ meshes. Their mesh outputs are PLY.
-- Height false-color is a per-vertex PLY export; there is no UV texture, MTL file, PNG texture, or `--height_texture_size` option.
-- `color_mesh` no longer supports `--remesh` or `--remesh_smooth_iterations`, preserving camera-derived vertex color.
-- `texture_baking` no longer creates an ATAK zip or ATAK-specific package. It stops after writing the baked OBJ and PNG texture.
-- `texture_baking` does not accept camera-projection color options (`--max_time_diff`, `--color_min_depth`, `--color_max_depth`, or `--gray_filter_radius`) or remeshing options.
-- The `tiles_3d` and `color_tiles_3d` pipelines (Cesium 3D Tiles output), their GUI profiles, and the `py3dtiles`/`pyproj` dependencies were removed.
-- `og_map`'s `--octree_discretize` now defaults to **off** (previously on). The `pyoctomap` build pinned in the Docker image crashes with `AttributeError: 'OcTreeKey' object has no attribute 'thisptr'` whenever `insertPointCloud()` is called with `discretize=True`. The flag still exists — pass `--octree_discretize` explicitly to re-enable it, and expect it to crash until that upstream `pyoctomap` bug is fixed. The GUI's OG Map profile checkbox for this option is unchecked by default to match.
-
 ## Project layout
 
 ```text
